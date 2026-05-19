@@ -206,6 +206,7 @@ def save_episode_html(
     episode_path,
     html_fname="display",
     video_fname="execute.mp4",
+    include_video=True,
     video_include_steps=False,
     sender_keys=["Alice", "Bob", "Chad", "Dave", "SystemPrompt", "UserPrompt", "Feedback", "Action"],
     ):
@@ -263,6 +264,7 @@ def save_episode_html(
         all_html_blocks.append(
             compose_html_block(
                 container_name=f"chat-container-{step}",
+                include_video=include_video,
                 video_fname=video_fname_cur,
             )
         )
