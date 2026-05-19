@@ -209,6 +209,7 @@ class MujocoSimEnv:
         randomize_init=True,
         np_seed=0,
         render_point_cloud=False, 
+        record_video=True,
         skip_reset=False,
         ):
         # print(filepath)
@@ -241,13 +242,15 @@ class MujocoSimEnv:
 
         # check rendering options
         self.render_point_cloud = render_point_cloud
+        self.record_video = record_video
         self.render_buffers = dict()
         for cam in render_cameras:
-            try:
-                self.physics.render(camera_id=cam, height=image_hw[0], width=image_hw[1])
-            except Exception as e:
-                print("Got Error: ", e)
-                print("Camera {} does not exist in the xml file".format(cam))
+            if self.record_video:
+                try:
+                    self.physics.render(camera_id=cam, height=image_hw[0], width=image_hw[1])
+                except Exception as e:
+                    print("Got Error: ", e)
+                    print("Camera {} does not exist in the xml file".format(cam))
             self.render_buffers[cam] = deque(maxlen=3000)
         self.render_cameras = render_cameras
         self.render_freq = render_freq
@@ -307,7 +310,8 @@ class MujocoSimEnv:
         # clear out render buffers
         self.clear_camera_buffer()
         self.clear_save_buffer()
-        self.render_all_cameras()
+        if self.record_video:
+            self.render_all_cameras()
         obs = self.get_obs()
         self.timestep = 0
         return obs
@@ -692,7 +696,7 @@ class MujocoSimEnv:
             if eq_active_idxs is not None and len(eq_active_idxs) > 0:
                 self.physics.model.eq_active[eq_active_idxs] = eq_active_vals
             self.physics.step() 
-            if step % self.render_freq == 0:
+            if self.record_video and step % self.render_freq == 0:
                 self.render_all_cameras()
             
             if step % self.sim_save_freq == 0: 
@@ -705,7 +709,8 @@ class MujocoSimEnv:
                     print(f"Sim Steped {step} steps, Error: {error}")
                 if error < self.error_threshold and step > self.render_freq * 2:
                     break  
-        self.render_all_cameras()
+        if self.record_video:
+            self.render_all_cameras()
         
         self.physics.model.pair_margin[:] = contact_margins
         self.physics.forward()
@@ -836,5 +841,4 @@ class MujocoSimEnv:
 
     
     
-
 
