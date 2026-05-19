@@ -497,7 +497,9 @@ def main(args):
         args.split_parsed_plans = True
         args.max_failed_waypoints = 0
         args.direct_waypoints = 0
-        logging.warning("PackGroceryTask requires split parsed plans, and no failed waypoints, no direct waypoints\n")
+        args.tsteps = max(args.tsteps, 12)
+        args.rrt_timeout = min(args.rrt_timeout, 30)
+        logging.warning("PackGroceryTask uses split parsed plans, serial fallback, at least 12 tsteps, and 30s RRT timeout\n")
 
     render_freq = 600
     if args.control_freq == 15:

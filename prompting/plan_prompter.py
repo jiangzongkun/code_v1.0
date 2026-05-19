@@ -23,12 +23,21 @@ PACK_PICK_BATCHES = [
     ("banana", "apple"),
 ]
 PACK_ROBOT_ITEM_PREFERENCE = {
-    "ur5e_robotiq": ["bread", "cereal", "banana"],
-    "panda": ["milk", "soda_can", "apple"],
+    "ur5e_robotiq": ["bread", "banana"],
+    "panda": ["milk", "soda_can", "cereal", "apple"],
 }
 PACK_ROBOT_ALLOWED_ITEMS = {
-    "ur5e_robotiq": {"bread", "cereal", "banana"},
-    "panda": {"milk", "soda_can", "apple"},
+    "ur5e_robotiq": {"bread", "banana"},
+    "panda": {"milk", "soda_can", "cereal", "apple"},
+}
+PACK_ROBOT_PRIORITY = ["ur5e_robotiq", "panda"]
+PACK_ITEM_SLOT_PREFERENCE = {
+    "milk": ["bin_back_left", "bin_back_right", "bin_back_middle"],
+    "cereal": ["bin_back_middle", "bin_back_right", "bin_front_right", "bin_front_middle"],
+    "bread": ["bin_front_left", "bin_front_middle", "bin_front_right"],
+    "soda_can": ["bin_back_right", "bin_front_right", "bin_back_middle"],
+    "banana": ["bin_front_middle", "bin_front_right", "bin_back_middle"],
+    "apple": ["bin_back_middle", "bin_back_right", "bin_front_right"],
 }
 SORT_CUBE_ORDER = ["blue_square", "pink_polygon", "yellow_trapezoid"]
 SORT_CUBE_TARGETS = {
@@ -60,9 +69,9 @@ Each <coord> is a tuple (x,y,z) for gripper location, follow these steps to plan
 13) WAIT is allowed when it prevents collision. For WAIT, keep the robot stationary by repeating its current gripper position in the PATH.
 14) If simultaneous PLACE actions fail or involve large objects, use one PLACE action and one WAIT action.
 15) Follow this fixed batch order unless the named object is already packed: first bread+milk, then cereal+soda_can, then banana+apple.
-16) Prefer assignments: Alice handles bread, cereal, banana; Bob handles milk, soda_can, apple.
+16) Prefer assignments: Alice handles bread and banana; Bob handles milk, soda_can, cereal, and apple. Cereal should be handled by Bob because Alice often times out when placing it.
 16a) If the preferred robot cannot reach its assigned object or keeps failing, let the other robot take over that object while the preferred robot WAITs.
-17) If both robots PICK and the plan fails due to collision, keep the batch but separate the PATHs, or use one PICK and one WAIT.
+17) For Pack, prefer one active robot per round: one PICK or one PLACE, while the other robot WAITs. This reduces bin-area collisions and RRT timeouts.
 18) For simultaneous PICK actions, keep Alice's and Bob's first two PATH points separated by at least 0.35 in x-y distance.
 19) For PICK actions, every PATH coordinate should keep z >= 0.45 so the gripper stays above objects and the table; the simulator will handle the final grasp target.
 20) For apple and soda_can, use a high vertical approach with z around 0.72 before the final grasp.
@@ -169,13 +178,34 @@ NAME Bob ACTION <PICK rope_back_end or PUT rope_back_end groove_right_end> PATH 
     if env.__class__.__name__ == "PackGroceryTask":
         return """
 Pack all grocery items into the bin. Do not show reasoning.
-- PICK only if your gripper is EMPTY. PLACE only if you are already holding the item.
-- PATH must have EXACTLY 4 (x,y,z) coords starting from near your CURRENT GRIPPER toward the target. First waypoint must be within 0.5m of your gripper, NOT at the target position. Compute evenly spaced waypoints: step=(target-gripper)/5; wp[i]=gripper+step*i for i=1,2,3,4.
-- Items shown as "inside slot ..." in [Scene description] are already packed - do NOT PICK or PLACE them again. Do NOT PLACE into a slot already occupied by another item.
-- Bob (Panda) CANNOT reach items at x < -0.35. If an item is at x < -0.35, Alice must PICK it; Bob should pick a closer item.
-- Alice (UR5E) stands at near side (y~0); Bob (Panda) stands at far side (y~1.0). Both robots MUST act every round unless truly blocked - never have both WAIT.
-- Bob should proactively PICK items nearest to Bob's gripper, then PLACE into an empty bin slot.
-- For WAIT, PATH must be exactly 4 identical coords at the gripper's current position.
+
+[State Reading - do this FIRST]
+- Read [Task Progress] line: items listed as "Already packed" are DONE - never PICK or PLACE them.
+- Read [Alice hand status] and [Bob hand status]: if holding something, must PLACE it next.
+- Read bin slot lines: slots marked "[occupied by X]" are full - do NOT PLACE into them.
+- Read item lines: items marked "[ALREADY PACKED]" must not be touched.
+- Items marked "[needs to be packed]" and still "on table" are the only valid PICK targets.
+
+[Action Rules]
+- PICK only if your [hand status] says "nothing (gripper empty)". Never PICK an already-packed item.
+- PLACE only if you are already holding the item. Choose a slot marked "[empty]".
+- Prefer one active robot per round: one robot PICKs or PLACEs, the other WAITs. This is safer than parallel motion around the bin.
+- Two robots MUST NOT pick the same item in the same round.
+- Bob (Panda) CANNOT reach items at x < -0.35. If an item is at x < -0.35, Alice must handle it.
+- Alice stands near side (y~0); Bob stands far side (y~1.0). Assign items by proximity.
+- Preferred assignment: Alice handles bread/cereal/banana; Bob handles milk/soda_can/apple.
+- If preferred robot cannot reach, the other robot takes over; preferred robot WAITs.
+- WAIT is expected for the non-active robot. Never have BOTH robots WAIT simultaneously.
+
+[PATH Rules]
+- PATH must have EXACTLY 4 (x,y,z) coords.
+- First waypoint must be within 0.5m of your CURRENT GRIPPER, NOT at the target.
+- Evenly spaced: step=(target-gripper)/5; wp[i]=gripper+step*i for i=1,2,3,4.
+- Keep z between 0.45 and 0.78; for PLACE actions use z >= 0.60 (z >= 0.68 for cereal/milk).
+- For WAIT: PATH must be exactly 4 identical coords at the gripper's current position.
+- For simultaneous PICK: keep first two waypoints separated by >= 0.35 in x-y distance.
+- For simultaneous PLACE: choose different slots; keep paths far apart to avoid collision.
+
 Output only:
 EXECUTE
 NAME Alice ACTION <PICK item PATH <4 coords> | PLACE item slot PATH <4 coords> | WAIT PATH <4 coords>>
@@ -551,62 +581,97 @@ class SingleThreadPrompter:
         if len(candidates) == 0:
             return None
 
-        robot_names = list(self.env.robot_name_map.keys())
-        best_assignment = None
+        best_choice = None
         for allow_handoff in (False, True):
             best_cost = float("inf")
-
-            for first_item in candidates + [None]:
-                for second_item in candidates + [None]:
-                    assignment = {
-                        robot_names[0]: first_item,
-                        robot_names[1]: second_item,
-                    }
-                    assigned_items = [item for item in assignment.values() if item is not None]
-                    if len(set(assigned_items)) != len(assigned_items):
-                        continue
-                    if len(assigned_items) == 0:
-                        continue
-
-                    total_cost = 0.0
-                    valid = True
-                    for robot_name, item in assignment.items():
-                        if item is None:
-                            total_cost += 0.35
-                            continue
-                        cost = self._pack_pick_cost(
-                            obs,
-                            robot_name,
-                            item,
-                            allow_handoff=allow_handoff,
-                        )
-                        if not np.isfinite(cost):
-                            valid = False
-                            break
-                        total_cost += cost
-                    if valid and total_cost < best_cost:
-                        best_cost = total_cost
-                        best_assignment = assignment
-
-            if best_assignment is not None:
+            for robot_name in PACK_ROBOT_PRIORITY:
+                if self._held_pack_object(obs, robot_name) is not None:
+                    continue
+                for item in candidates:
+                    cost = self._pack_pick_cost(
+                        obs,
+                        robot_name,
+                        item,
+                        allow_handoff=allow_handoff,
+                    )
+                    if np.isfinite(cost) and cost < best_cost:
+                        best_cost = cost
+                        best_choice = (robot_name, item)
+            if best_choice is not None:
                 break
 
-        if best_assignment is None:
+        if best_choice is None:
             return None
 
+        chosen_robot, chosen_item = best_choice
         lines = ["EXECUTE"]
         for robot_name, agent_name in self.env.robot_name_map.items():
-            item = best_assignment.get(robot_name)
-            if item is None:
+            if robot_name != chosen_robot:
                 lines.append(
                     f"NAME {agent_name} ACTION WAIT PATH {self._wait_path(obs, robot_name)}"
                 )
                 continue
-            path = self._pick_path(obs, robot_name, item)
+            path = self._pick_path(obs, robot_name, chosen_item)
             lines.append(
-                f"NAME {agent_name} ACTION PICK {item} PATH {self._format_path(path)}"
+                f"NAME {agent_name} ACTION PICK {chosen_item} PATH {self._format_path(path)}"
             )
         return "\n".join(lines)
+
+    def _build_pack_pick_candidate(
+        self,
+        obs: EnvState,
+        chosen_robot: str,
+        chosen_item: str,
+    ) -> str:
+        lines = ["EXECUTE"]
+        for robot_name, agent_name in self.env.robot_name_map.items():
+            if robot_name != chosen_robot:
+                lines.append(
+                    f"NAME {agent_name} ACTION WAIT PATH {self._wait_path(obs, robot_name)}"
+                )
+                continue
+            path = self._pick_path(obs, robot_name, chosen_item)
+            lines.append(
+                f"NAME {agent_name} ACTION PICK {chosen_item} PATH {self._format_path(path)}"
+            )
+        return "\n".join(lines)
+
+    def _pack_pick_candidate_responses(
+        self,
+        obs: EnvState,
+        available_items: List[str],
+        batch_items: List[str],
+    ) -> List[str]:
+        candidates = batch_items if len(batch_items) > 0 else available_items
+        candidates = [item for item in candidates if item in available_items]
+        if len(candidates) == 0:
+            return []
+
+        responses = []
+        seen = set()
+        for allow_handoff in (False, True):
+            choices = []
+            for robot_name in PACK_ROBOT_PRIORITY:
+                if self._held_pack_object(obs, robot_name) is not None:
+                    continue
+                for item in candidates:
+                    cost = self._pack_pick_cost(
+                        obs,
+                        robot_name,
+                        item,
+                        allow_handoff=allow_handoff,
+                    )
+                    if np.isfinite(cost):
+                        choices.append((cost, robot_name, item))
+
+            for _, robot_name, item in sorted(choices):
+                key = (robot_name, item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                responses.append(self._build_pack_pick_candidate(obs, robot_name, item))
+
+        return responses
 
     def _current_pack_batch_items(self, obs: EnvState, available_items: List[str]) -> List[str]:
         if len(available_items) == 0:
@@ -642,6 +707,7 @@ class SingleThreadPrompter:
         self,
         obs: EnvState,
         robot_name: str,
+        item: str,
         empty_slots: List[str],
         used_slots: set,
     ) -> Optional[str]:
@@ -651,12 +717,36 @@ class SingleThreadPrompter:
         if len(candidates) == 0:
             return None
 
+        failed_slots = self._failed_pack_place_slots(item)
+        candidates = [slot for slot in candidates if slot not in failed_slots] or candidates
+
+        preferred = [
+            slot for slot in PACK_ITEM_SLOT_PREFERENCE.get(item, [])
+            if slot in candidates
+        ]
+        if len(preferred) > 0:
+            return preferred[0]
+
         robot_state = getattr(obs, robot_name)
         robot_xy = robot_state.ee_xpos[:2]
         return min(
             candidates,
             key=lambda slot: np.linalg.norm(self.env.bin_slot_xposes[slot][:2] - robot_xy),
         )
+
+    def _failed_pack_place_slots(self, item: str) -> set:
+        failed_slots = set()
+        if item is None:
+            return failed_slots
+        slot_names = set(getattr(self.env, "bin_slot_xposes", {}).keys())
+        for failed_plan in self.failed_plans:
+            for line in str(failed_plan).splitlines():
+                if f"PLACE {item} " not in line:
+                    continue
+                for slot in slot_names:
+                    if slot in line:
+                        failed_slots.add(slot)
+        return failed_slots
 
     def _choose_placing_robot(self, held_by_robot: Dict[str, Optional[str]]) -> Optional[str]:
         priority = ["panda", "ur5e_robotiq"]
@@ -702,7 +792,7 @@ class SingleThreadPrompter:
                 continue
 
             if held_obj is not None and len(empty_slots) > 0:
-                slot = self._choose_pack_slot(obs, robot_name, empty_slots, used_slots)
+                slot = self._choose_pack_slot(obs, robot_name, held_obj, empty_slots, used_slots)
                 if slot is None:
                     return None
                 used_slots.add(slot)
@@ -746,6 +836,73 @@ class SingleThreadPrompter:
         if not made_progress:
             return None
         return "\n".join(lines)
+
+    def build_pack_fallback_candidates(self, obs: EnvState) -> List[str]:
+        """Create ranked Pack fallback plans and let feedback reject collisions.
+
+        A single greedy pick can get stuck when the grasp target is valid but
+        the goal IK collides with a neighboring grocery item. Returning the
+        ranked alternatives lets validation advance to the next item/robot
+        without waiting for an outer retry loop.
+        """
+        if not hasattr(self.env, "item_names") or not hasattr(self.env, "bin_slot_xposes"):
+            return []
+
+        available_items = self._available_pack_items(obs)
+        batch_items = self._current_pack_batch_items(obs, available_items)
+        empty_slots = self._empty_pack_slots(obs)
+        held_by_robot = {
+            robot_name: self._held_pack_object(obs, robot_name)
+            for robot_name in self.env.robot_names
+        }
+        placing_robot = self._choose_placing_robot(held_by_robot)
+
+        responses = []
+        if placing_robot is None and all(held_obj is None for held_obj in held_by_robot.values()):
+            responses = self._pack_pick_candidate_responses(obs, available_items, batch_items)
+        elif placing_robot is not None:
+            held_obj = held_by_robot.get(placing_robot)
+            if held_obj is not None:
+                failed_slots = self._failed_pack_place_slots(held_obj)
+                slot_candidates = [
+                    slot for slot in empty_slots
+                    if slot not in failed_slots
+                ] or empty_slots
+                preferred = [
+                    slot for slot in PACK_ITEM_SLOT_PREFERENCE.get(held_obj, [])
+                    if slot in slot_candidates
+                ]
+                remaining = [slot for slot in slot_candidates if slot not in preferred]
+                ordered_slots = preferred + sorted(
+                    remaining,
+                    key=lambda slot: np.linalg.norm(
+                        self.env.bin_slot_xposes[slot][:2]
+                        - getattr(obs, placing_robot).ee_xpos[:2]
+                    ),
+                )
+                for slot in ordered_slots:
+                    lines = ["EXECUTE"]
+                    for robot_name, agent_name in self.env.robot_name_map.items():
+                        if robot_name != placing_robot:
+                            lines.append(
+                                f"NAME {agent_name} ACTION WAIT PATH {self._wait_path(obs, robot_name)}"
+                            )
+                            continue
+                        target = self.env.bin_slot_xposes[slot].copy()
+                        path = self._interpolate_path(
+                            getattr(obs, robot_name).ee_xpos,
+                            target,
+                            SAFE_PLACE_HEIGHT,
+                        )
+                        lines.append(
+                            f"NAME {agent_name} ACTION PLACE {held_obj} {slot} PATH {self._format_path(path)}"
+                        )
+                    responses.append("\n".join(lines))
+
+        greedy_response = self.build_pack_fallback_response(obs)
+        if greedy_response is not None and greedy_response not in responses:
+            responses.append(greedy_response)
+        return responses
 
     def _sweep_cube_in_contact(self, obs: EnvState, cube: str, contact_name: str) -> bool:
         if cube not in obs.objects:
@@ -1118,8 +1275,8 @@ class SingleThreadPrompter:
             obstacle_tops = [self.env.physics.data.site(n).xpos[2] for n in ["obstacle_wall_front_top", "obstacle_wall_back_top"] if self.env.physics.model.site(n).id >= 0]
             lift_z = (max(obstacle_tops) + 0.06) if obstacle_tops else 0.52
             lift_z = min(lift_z, 0.52)
-            # Alice (rope_front, starts left at x≈-1.2) → groove_LEFT (x≈0.20): paths diverge, no crossing with Bob
-            # Bob (rope_back, starts at x≈-0.54) → groove_RIGHT (x≈1.00): Bob goes further right
+            # Alice (rope_front, starts left at x about -1.2) goes to groove_LEFT.
+            # Bob (rope_back, starts at x about -0.54) goes to groove_RIGHT.
             a_path = _alice_rope_place(alice_pos, groove_left, lift_z)
             b_path = _bob_rope_place(bob_pos, groove_right)
             return (
@@ -1173,6 +1330,8 @@ class SingleThreadPrompter:
             return self.build_rope_fallback_candidates(obs)
         if self.env.__class__.__name__ == "CabinetTask":
             return self.build_cabinet_fallback_candidates(obs)
+        if self.env.__class__.__name__ == "PackGroceryTask":
+            return self.build_pack_fallback_candidates(obs)
         response = self.build_fallback_response(obs)
         return [] if response is None else [response]
 
@@ -1482,10 +1641,5 @@ Re-format to strictly follow [Action Output Instruction]!
     def post_episode_update(self):
         # clear for next episode
         self.round_history = []
-        self.failed_plans = [] 
+        self.failed_plans = []
         self.response_history = []
-
-
-
-
-
