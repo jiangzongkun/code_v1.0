@@ -242,7 +242,7 @@ class MultiArmRRT:
         joint_names, 
         tol=1e-6,
         max_steps=300,
-        max_resets=20,
+        max_resets=40,
         inplace=True, 
         max_range_steps=0,
         qpos_idxs=None,

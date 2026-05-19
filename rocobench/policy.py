@@ -62,6 +62,7 @@ class PlannedPathPolicy:
         self.inhand = path_plan.get_inhand_ids(physics).copy()
         self.grasp_allowed = path_plan.get_allowed_collision_ids(physics).copy()
         self.allowed_collision_pairs = allowed_collision_pairs
+        self.ik_failed_reason = None
         self.parse_llm_plan_to_qpos(
             physics, path_plan, update=True
             )
@@ -71,6 +72,9 @@ class PlannedPathPolicy:
         self.skip_smooth_path = skip_smooth_path # skip smoothing the path, useful for debugging
         self.plan_splitted = plan_splitted # if True, the plan is splitted into two parts, one for each robot
         self.timeout = timeout # timeout for each planning step, in number of planning steps
+
+    def is_waiting_robot(self, robot_name: str) -> bool:
+        return self.path_plan.action_strs.get(robot_name, "").strip().upper() == "WAIT"
 
     def augment_release_plan_inhand(self, physics, path_plan: LLMPathPlan):
         """Treat an actively welded object as in-hand while planning its release."""
@@ -144,13 +148,27 @@ class PlannedPathPolicy:
         for _name in self.robot_names:
             assert _name in ee_poses.keys(), f"missing robot name {_name} in ee_poses"
         full_qpos_result = physics.data.qpos.copy()
-        qpos_target_dict = self.rrt_planner.inverse_kinematics_all(
+        qpos_target_dict = {}
+        active_ee_poses = {}
+        for _name, ee_pose in ee_poses.items():
+            robot = self.robots[_name]
+            qpos_idxs = robot.joint_idxs_in_qpos
+            if self.is_waiting_robot(_name):
+                qpos_target_dict[_name] = (physics.data.qpos[qpos_idxs].copy(), qpos_idxs)
+            else:
+                active_ee_poses[_name] = ee_pose
+
+        if len(active_ee_poses) == 0:
+            return qpos_target_dict, full_qpos_result
+
+        active_qpos_target_dict = self.rrt_planner.inverse_kinematics_all(
             physics=physics,
-            ee_poses=ee_poses,
+            ee_poses=active_ee_poses,
             allow_grasp=True, 
-            check_grasp_ids=self.inhand,
+            check_grasp_ids=self.grasp_allowed,
             check_relative_pose=self.check_relative_pose,
         ) # qpos for the robots only
+        qpos_target_dict.update(active_qpos_target_dict)
         for _name, ik_result in qpos_target_dict.items():
             if ik_result is not None:
                 robot_qpos, qpos_idxs = ik_result[0], ik_result[1] 
@@ -171,8 +189,13 @@ class PlannedPathPolicy:
         qpos_target_dict, full_qpos_target = self.ik_ee_poses_to_qpos(
             physics, path_plan.ee_target_poses
         ) 
-        for _name, ik_result in qpos_target_dict.items():
-            assert ik_result is not None, f"failed to compute IK for {_name}" 
+        failed_robots = [
+            _name for _name, ik_result in qpos_target_dict.items()
+            if ik_result is None
+        ]
+        if len(failed_robots) > 0:
+            self.ik_failed_reason = f"failed to compute IK for {', '.join(failed_robots)}"
+            return None, [], None, []
         joint_qpos_target = full_qpos_target[self.rrt_planner.all_joint_idxs_in_qpos]
  
         # target_qpos are NOT allowed to be IK-insolvable, but waypoints might be
@@ -261,6 +284,8 @@ class PlannedPathPolicy:
         return tograsp 
 
     def plan_qpos(self, physics):
+        if self.ik_failed_reason is not None:
+            return None, self.ik_failed_reason
         start_qpos = physics.data.qpos.copy()
         joints_start_qpos = start_qpos[self.rrt_planner.all_joint_idxs_in_qpos] 
         
