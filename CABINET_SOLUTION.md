@@ -2,6 +2,83 @@
 
 本项目基于开源 RoCo / RoCoBench 框架完成 Cabinet 多机器人协同柜门操作任务。原框架使用大语言模型生成多机器人协作动作，通过文本解析器转换为机器人动作，再由 MuJoCo 环境、反馈模块和 RRT 路径规划器验证并执行。
 
+## 2026-05-19 失败分析与修复
+
+分析目录：
+
+- `output/run_20260519_021721/tasks/02_cabinet`：5 个 run 中仅 `run_2` 成功，成功率 1/5。
+- `output/run_20260519_034509/tasks/02_cabinet`：5 个 run 中仅 `run_2` 成功，成功率 1/5，且有 2 个超时。
+
+共同失败模式不是开门顺序错误。多数失败 run 都按相同的前 4 步执行：Alice/Bob 抓左右门把手，Alice/Bob 打开门，Chad 搬 `mug`，Chad 搬 `cup`。真正的问题在 `PICK cup PLACE cup_coaster` 执行后，`cup` 没有稳定落到 `cup_coaster`，而是偏到桌面边缘或低处，例如历史日志中出现过 `(0.8, 0.3, 0.2)`、`(0.5, 1.1, -0.4)`、`(-0.2, 1.1, -0.4)`。之后任务尚未完成，模型又经常输出全员 `WAIT`，被环境反馈拒绝；或者继续让 Chad 抓 `cup`，但 cup 已经不可达，触发 `Out of reach`，最终耗尽步数或超时。
+
+本次修复面向机制，不针对固定 seed 或固定坐标：
+
+1. `prompting/plan_prompter.py`
+   - Cabinet 改回默认 LLM-first：先让模型根据当前场景规划；只有模型多次输出不可解析或不可执行动作时，才调用确定性 fallback 兜底。
+   - 将 fallback 的状态机规则提升为高质量 Cabinet prompt：按门是否关闭、机器人是否已抓住门把手、mug/cup 是否在杯垫上来决定下一步，严格要求只输出 `EXECUTE` block。
+   - prompt 根据当前柜体/把手位置选择左右侧分工，不针对固定 run 或固定 seed；fallback 也继续根据 `cabinet_pos` 动态选择门机器人和取物机器人。
+   - 明确“mug/cup 未完成时不能全员 `WAIT`”、“必须等两扇门都打开后再取物”、“`PICK mug/cup` 必须和 `PLACE coaster` 写在同一个动作里”。
+
+2. `prompting/parser.py`
+   - 对 Cabinet 的 `PICK mug/cup PLACE coaster` 增加专用搬运路径：从柜内抓取后先抬高，再水平移动到 coaster 上方，再下降释放。
+   - 路径由当前抓取点、目标 coaster 和物体几何半径计算，避免低空直线横移擦碰柜体、桌面或导致杯子释放不稳。
+   - Cabinet 放置后不再强制回 home，避免释放瞬间或释放后回撤动作把杯子再次带偏。
+   - 对 Cabinet 门把手抓取不再使用固定高度，而是从 MuJoCo 模型中的把手 cylinder 几何生成同一根把手上的候选点，再用正式的碰撞感知 IK 选择可达点。
+   - 对 `mug/cup` 抓取不再写固定平移量；从 weld body、物体几何半径、物体垂直范围和当前机器人末端位置生成接近方向候选点，再用同一套 IK/碰撞检查选择候选。
+
+3. `rocobench/policy.py`
+   - `policy.py` 是执行层：把 parser 生成的末端目标转换为 IK、RRT 路径、夹爪/吸盘控制和 MuJoCo weld 开关。
+   - 修复 release 计划的状态不一致：如果释放阶段发现对应物体的 weld 已经 active，就把该物体作为 in-hand 物体加入规划，让 RRT/碰撞检查按“机器人手里拿着 cup/mug”的真实状态规划。
+   - `WAIT` 机器人保持当前关节状态，不再重新对当前末端位姿做 IK，避免等待开门的机器人在取物阶段引入无关 IK 扰动。
+
+4. `rocobench/envs/task_cabinet.py`
+   - 修正 Cabinet 可达性反馈：根据柜体在桌面左侧或右侧动态判断 Alice/Bob/Chad 能到达的门把手，避免 prompt 或 fallback 被错误反馈带偏。
+   - 保留门把手优先级约束：单独推进非优先门前，必须先抓住或同时抓住优先门，避免某些场景下一扇门先打开后挡住另一侧抓取。
+
+5. `rocobench/rrt_multi_arm.py`
+   - 将 IK reset 搜索预算从 20 提高到 40。随机 seed 下某些合法候选点在 20 次 reset 时会偶发失败，但 40 次稳定成功；这是通用搜索预算提升，不依赖 Cabinet 坐标。
+
+验证结果：
+
+```bash
+/root/miniconda3/envs/roco/bin/python -m compileall run_dialog.py prompting rocobench/envs rocobench/policy.py
+```
+
+结果：通过。
+
+固定 seed 0 的 LLM-first plan mode 已通过完整 Cabinet 流程：
+
+```bash
+MUJOCO_GL=egl xvfb-run -a /root/miniconda3/envs/roco/bin/python run_dialog.py --task cabinet --run_name cabinet --data_dir output/direct_plan_proxy --start_id 0 --num_runs 1 --skip_display --comm_mode plan --tsteps 10 --seed 0 --run_timeout 600
+```
+
+结果：`output/direct_plan_proxy/cabinet/run_0_seed_0/steps3_success_True.json`，step 0 抓门把手，step 1 开门，step 2 放 `mug`，step 3 放 `cup`。
+
+随机 seed 验证暴露过两个额外问题：
+
+- base seed `927311687` 下的多个 run 在 step 0 失败于 Bob `PICK right_door_handle` IK，失败目标高度约 `0.63-0.66`。修复后把手抓取点由把手几何和 IK 选择，不再固定到某个高度。
+- seed `179283730` 下开门后 `mug` 抓取会因为高位目标和 IK 随机 reset 不稳定而失败。修复后 `mug/cup` 抓取点由 weld 点、物体几何和碰撞感知 IK 共同选择，并提升 IK 搜索预算。
+
+随机 seed 复验命令：
+
+```bash
+MUJOCO_GL=egl xvfb-run -a /root/miniconda3/envs/roco/bin/python run_dialog.py --task cabinet --run_name cabinet --data_dir output/direct_plan_handle_seed927311691 --start_id 0 --num_runs 1 --skip_display --comm_mode plan --tsteps 10 --seed 927311691 --run_timeout 600
+```
+
+结果：`output/direct_plan_handle_seed927311691/cabinet/run_0_seed_927311691/steps3_success_True.json`，用时约 301.53 秒。该场景在修复前会卡在 step 0 的 Bob 右门把手 IK，修复后能完成开门、搬 `mug`、搬 `cup` 全流程。
+
+```bash
+MUJOCO_GL=egl xvfb-run -a /root/miniconda3/envs/roco/bin/python run_dialog.py --task cabinet --run_name cabinet --data_dir output/direct_plan_general3_seed179283730 --start_id 0 --num_runs 1 --skip_display --comm_mode plan --tsteps 10 --seed 179283730 --run_timeout 600
+```
+
+结果：`output/direct_plan_general3_seed179283730/cabinet/run_0_seed_179283730/steps3_success_True.json`，用时约 431.07 秒。该场景覆盖了随机高把手、开门后 `mug` 高位抓取和 `cup` 放置。
+
+继续按 evaluator 入口运行 3 次随机 seed 复验：
+
+```bash
+MUJOCO_GL=egl xvfb-run -a /root/miniconda3/envs/roco/bin/python -c "from evaluator import test_run_dialog; test_run_dialog('cabinet', 3, 'output/single_task_gpu', comm_mode='plan', run_timeout=600)"
+```
+
 ## 任务理解
 
 Cabinet 任务中，三个机器人需要从柜子中取出杯子并放置到指定位置：
@@ -253,6 +330,13 @@ def get_reward_done(self, obs: EnvState):
 - Alice和Bob保持WAIT保持柜门打开
 - Chad PICK cup并PLACE到cup_coaster
 - 完成放置任务
+
+## 公共规划器合并记录（PR #1）
+
+- 动机：合并远程 PR #1 `Improve multi-arm path planning robustness`，提升多机械臂路径规划稳定性，同时保留 main 上 Cabinet release 规划中“已焊接物体视为 in-hand”的修复。
+- 改动点：`rocobench/policy.py` 同时保留 `augment_release_plan_inhand` 和 `sparsify_validated_path`；`rocobench/rrt.py` 修正 near/center sampler 的区间采样；`rocobench/rrt_multi_arm.py` 使用末端局部坐标维护 in-hand 物体相对位姿、放宽 IK 容差、默认只允许末端执行器接触抓取物，并让 split plan 保留强制 waypoints。
+- 运行命令：`python -m compileall run_dialog.py prompting rocobench/envs rocobench/policy.py rocobench/rrt.py rocobench/rrt_multi_arm.py`
+- 验证结果：2026-05-19 语法检查通过；本次未重新跑完整仿真评测，建议按本任务推荐命令复验成功率。
 
 ## 引用
 

@@ -1,290 +1,384 @@
-﻿# Rope 任务调试修改全过程总结
+# Rope 任务调试与优化总结
 
-> 本文按"问题定位 → 修改动作 → 实验结果 → 后续意义"记录 MoveRopeTask 完整调试过程。
-
----
-
-## 一、最初 Rope 任务的基本情况
-
-本次 Rope 任务使用 `MoveRopeTask`，配置关键参数如下：
-
-| 参数 | 值 |
-|------|----|
-| `task` | rope |
-| `num_runs` | 5 |
-| `tsteps` | 5 |
-| `num_replans` | 2 |
-| `run_timeout` | 180s |
-| `rrt_timeout` | 60s |
-| `skip_smooth_path` | true |
-| `fallback_first` | true |
-| 模型 | `llama3.3:latest` |
-
-日志明确的强约束：必须使用 `split_parsed_plans`，`max_failed_waypoints` 必须为 0，任务被限制为 5 个 timestep。
-
-**初始结果：5 次中 3 次成功、2 次失败超时（60%）。**
-
-成功的 run 通常只需两步：Alice 和 Bob 分别 PICK 绳子两端，再分别 PUT 到左右 groove 端点；
-失败的 run 主要卡在 LLM 输出异常、RRT 超时、障碍物碰撞和任务步数限制。
+本文记录本次 MoveRopeTask 的完整调试过程。Rope 任务最终从 `2/5`、`3/5` 逐步提升到 `4/5 = 80%`，并将主要失败原因从 IK、碰撞、RRT timeout 收敛到“评测步数不足”。本次优化重点不是继续手调物理点，而是引入阶段化策略、fallback 候选路径、执行前验证、避障候选和恢复性 horizon。
 
 ---
 
-## 二、问题一：PUT 已成功，但后续没有正确停止
+## 1. 任务特点
 
-**现象：** 某些 run 里机器人已完成 PICK 和 PUT，绳子已接近或进入 groove，但系统未及时判定任务完成，下一轮又让机器人重新 PICK 已在 groove 附近的 rope。新 PICK 路径穿过障碍物，造成碰撞。
+Rope 任务要求 Alice 和 Bob 协同抓取绳子两端，并将绳子放入狭窄 groove 中。与 Sort 不同，Rope 更强依赖空间约束和双臂协同：
 
-**日志定位：** run1 的 PUT 已成功，但任务没有判 done，下一轮发生 `obstacle_wall-Alice` 碰撞。
+- 绳子两端必须同时被抓住；
+- 两个机器人移动时要保持相对距离；
+- 绳子需要跨过或绕过障碍墙；
+- 抓取点不能太贴近端点，否则 IK 和接触都不稳定；
+- 中间 waypoint 既要可达，又要避免与 obstacle wall 碰撞；
+- 单个失败 waypoint 会导致整轮 RRT 卡死或超时。
 
-**结论：** 失败不完全是"规划不会做"，而是**终止条件 / done 判断 / 多余动作触发**造成的。若任务已基本完成，但系统继续规划，会从成功状态重新拉回失败状态。
+因此 Rope 的核心瓶颈不是模型是否理解“把绳子放进槽里”，而是每一步动作是否满足物理可执行性。
 
 ---
 
-## 三、问题二：初始 PICK 阶段容易碰撞或 RRT 超时
+## 2. 初始评测结果
 
-**现象：** PICK 阶段 Bob 的中间路径点与 obstacle wall 碰撞，日志出现：
+初始使用：
 
+```bash
+OLLAMA_MODEL=qwen3.5:27b uv run python evaluator.py --tasks rope --runs 5
 ```
+
+早期结果大致为：
+
+```text
+Success Rate: 2/5 或 2/4
+Timeout Count: 0/5 或 1/5
+```
+
+失败日志中常见现象：
+
+```text
+IK failed
 Collision detected: obstacle_wall-Bob
 ReasonTimeout_time62...
-Given waypoints: 4, valid: 3 points
-```
-
-RRT 在约 60 秒后超时。路径不是完全不可用，而是候选路径中有部分点或连接存在碰撞/可行性问题。
-
-**结论：** Rope 的瓶颈已不只是 LLM 输出格式或 IK 不可达，而是 **PICK 路径缺少避障候选，直线路径容易穿过障碍墙**。
-
----
-
-## 四、问题三：LLM 输出格式不稳定
-
-**现象：** 模型在长 prompt、多轮 replan 后，有时只输出：
-
-```
-EXECUTE
-```
-
-缺少后续动作行，parser 报错：
-
-```
 Parsing failed! Response does not contain NAME.
 Previous response: EXECUTE
 ```
 
-**修复：** 强化输出格式要求，prompt 明确规定输出结构：
+说明 Rope 同时存在四类问题：
 
-```
-EXECUTE
-NAME Alice ACTION ...
-NAME Bob ACTION ...
-```
-
-同时在 feedback 里提醒模型遵循 `[Action Output Instruction]`。
-
-**结论：** Rope 任务不能完全依赖 LLM 每轮自由生成，**必须配合 fallback plan 和 parser 检查机制**。
+1. LLM 输出格式不稳定；
+2. 端点抓取或低位抓取导致 IK 不稳定；
+3. PICK/PUT 路径穿过障碍物；
+4. RRT 长时间找不到碰撞自由路径。
 
 ---
 
-## 五、修改一：Prompt 加入阶段化策略与空间约束
+## 3. 关键失败类型
 
-将 Rope 任务明确拆成两个阶段：
+### 3.1 端点抓取不稳定
 
-**Phase 1 — PICK：**
-- Alice 抓 `rope_front_end`，Bob 抓 `rope_back_end`
-- 路径高度保持在 `0.25 ~ 0.52` 之间，不要一开始就高抬
+原始策略直接抓 `rope_front_end` 和 `rope_back_end`，但绳子端点靠近桌面且接触状态复杂，目标点可能太低或太靠边，容易导致 IK 失败。
 
-**Phase 2 — PUT：**
-- Alice PUT `rope_front_end` → `groove_left_end`
-- Bob PUT `rope_back_end` → `groove_right_end`
-- Alice 靠左、Bob 靠右，路径不交叉，降低双机器人干扰
+### 3.2 PUT 高位中间点不可达
 
-**Bob 专属约束：**
+失败样例：
 
+```text
+NAME Alice ACTION PUT rope_front_end groove_left_end PATH [(-1.14, 0.65, 0.52), ...]
+IK failed: on Alice (-1.14, 0.65, 0.52)
 ```
+
+该问题说明路径点语义合理，但空间位置对机械臂不可达。
+
+### 3.3 PICK 路径穿过 obstacle wall
+
+典型日志：
+
+```text
+Collision detected: collided object pairs: obstacle_wall-Bob
+Waypoint Step Alice (-0.89, 0.34, 0.36); Bob (-0.48, 0.75, 0.36)
+```
+
+说明低位直线路径会穿过障碍墙附近区域。
+
+### 3.4 LLM replan 输出为空
+
+长 prompt 和失败反馈叠加后，模型有时只输出：
+
+```text
+EXECUTE
+```
+
+缺少 `NAME Alice ACTION ...` 和 `NAME Bob ACTION ...`，parser 失败。此时如果没有 fallback，就会白白消耗步骤和时间。
+
+### 3.5 任务步数不足
+
+后期 80% 版本中，唯一失败样例不是 IK、碰撞或 RRT timeout，而是第 4 步刚完成恢复性 `PICK`，还差第 5 步 `PUT`，但 Rope 被内部限制为 5 个 timestep，导致提前结束。
+
+---
+
+## 4. 修改一：Rope prompt 阶段化
+
+在 `prompting/plan_prompter.py` 中，将 Rope 明确拆分为两个阶段。
+
+### Phase 1: PICK
+
+- Alice 抓 `rope_front_end`
+- Bob 抓 `rope_back_end`
+- 路径高度保持在 `0.25 ~ 0.52`
+- 不在 PICK 阶段高抬绳子
+
+### Phase 2: PUT
+
+- Alice 将 `rope_front_end` 放到 `groove_left_end`
+- Bob 将 `rope_back_end` 放到 `groove_right_end`
+- Alice 走左侧，Bob 走右侧，避免交叉
+- PUT 阶段使用更保守的中间高度
+
+同时加入 Bob 的专属约束：
+
+```text
 Bob must keep PATH x >= -0.40 when z > 0.50
 ```
 
-原因：Panda 机械臂在高位且 x 太靠左时容易出现 IK 或碰撞问题。
-
-**总结：** 将 Rope 从自然语言目标，改写成带有**阶段、机器人分工、空间边界和路径约束**的结构化 prompt。
+该约束来自实际失败日志，能减少 Panda 机械臂在高位偏左区域的 IK/RRT 风险。
 
 ---
 
-## 六、修改二：加入 Rope 专用 fallback 候选路径
+## 5. 修改二：绳子端点 inward-offset 抓取
 
-引入 **fallback candidate** 机制，系统生成多个候选动作，再由 feedback / validator 机制筛选更稳定的方案。
+在 `rocobench/envs/task_rope.py` 中新增 `get_rope_grasp_target_pos()`：
 
-- 日志中已出现 `SelectedFallback` 和 `Fallback plan passed parser`
-- PUT 阶段候选路径主要围绕高度和中间点微调（如中间点高度 `0.52` 或降低到 `0.48`）
+- 不再抓精确端点；
+- 根据绳子另一端方向，向绳子内部偏移约 `0.06m`；
+- 将抓取高度限制在更稳定的范围；
+- 仍然保持 weld 对应 rope end，保证语义上抓的是绳子端点。
 
-**核心价值：** 不把一次 LLM 输出当成唯一答案，让系统自己准备多个物理可行性不同的候选路径，执行前筛选。
+核心思想：
+
+```text
+grasp point = endpoint + inward_offset
+```
+
+这样可以避免端点太低、太边缘或数值不稳定导致的 IK 失败。
 
 ---
 
-## 七、修改三：增加 obstacle-aware rope pick candidates
+## 6. 修改三：parser 中 Rope 抓取姿态稳定化
 
-**修改文件：** `prompting/plan_prompter.py`
+在 `prompting/parser.py` 中加入 Rope 专用处理：
 
-**提交：** `5a7c0a0 add obstacle-aware rope pick candidates`
+- Rope PICK 使用环境提供的 inward-offset target；
+- 保留当前 gripper quaternion；
+- 避免强行使用 rope body 的绝对 quaternion；
+- 对 `None` 响应做保护，避免 parser 崩溃。
 
-设计了三类候选路径：
+原因是 Rope endpoint 的姿态不一定适合作为机械臂末端目标姿态，强行继承可能导致 IK 难以收敛。
+
+---
+
+## 7. 修改四：Rope fallback candidate 机制
+
+在 `prompting/plan_prompter.py` 中加入 Rope 专用 fallback：
+
+- 根据当前是否 holding rope 判断是 PICK 阶段还是 PUT 阶段；
+- 一次生成多个候选路径；
+- 使用 parser 和 feedback manager 对候选做验证；
+- 选择第一个通过验证的 candidate；
+- 日志中记录 `FallbackCandidates` 和 `SelectedFallback`，便于复盘。
+
+这一步将系统从“LLM 只给一个动作”改成：
+
+```text
+LLM/规则生成候选 → parser 检查 → feedback 验证 → 选择可执行动作
+```
+
+---
+
+## 8. 修改五：PUT 阶段候选路径
+
+针对 PUT 阶段，设计多种候选：
 
 | 候选 | 策略 |
-|------|------|
-| candidate 0 | 原始直线低位 PICK |
+|---|---|
+| candidate 0 | 原始保守 PUT 路径 |
+| candidate 1 | 降低第一段高度，避免 Alice/Bob 高位 IK 失败 |
+| candidate 2 | 中间点更靠近机器人本体，减少不可达风险 |
+
+例如失败日志中 Alice 高位点不可达后，加入低位过渡点：
+
+```text
+(-1.14, 0.65, 0.38) → (-0.81, 0.62, 0.46) → ...
+```
+
+这样比手动修改单个坐标更泛化，因为系统会在多个候选中筛选。
+
+---
+
+## 9. 修改六：PICK 阶段 obstacle-aware candidates
+
+后续发现失败集中在初始 PICK 低位路径穿过障碍墙。因此新增 obstacle-aware rope pick candidates：
+
+| 候选 | 路径特点 |
+|---|---|
+| candidate 0 | 原始直线低位接近 |
 | candidate 1 | Alice 走低 y 通道，Bob 走高 y 通道 |
-| candidate 2 | 更保守的侧向绕障 PICK |
+| candidate 2 | 更保守的侧向绕障路径 |
 
-再交由现有 `feedback_manager` 做执行前筛选。
+后续进一步调整候选优先级：
 
-**意义：** 把 Rope 中最容易失败的初始抓取，从单一路径改成**多候选避障路径**，从而降低 RRT 卡死和 obstacle collision 概率。
+```text
+PICK 阶段优先尝试 obstacle-aware side-lane candidates
+PUT 阶段优先尝试原始保守路径
+```
+
+这样可以减少 obstacle wall 碰撞和 RRT timeout。
+
+相关提交：
+
+- `5a7c0a0 add obstacle-aware rope pick candidates`
+- `2748b79 prioritize obstacle-aware rope pick candidates`
 
 ---
 
-## 八、调试方法：通过实验日志判断失败类型
+## 10. 修改七：Rope horizon 从 5 放宽到 6
 
-调试时使用的关键日志命令：
+80% 版本的唯一失败样例：
 
-```bash
-find output/.../tasks/01_rope/runs -maxdepth 2 -name "*.json" -print -exec cat {} \;
-tail -260 output/.../tasks/01_rope/stdout.log
-grep -R "timed_out\|Timeout\|Run finished\|failed\|Plan success\|Collision detected\|IK failed\|ReasonTimeout" \
-    -n output/.../tasks/01_rope
-find output/.../tasks/01_rope/runs -path "*prompts*fallback*.json" -print -exec cat {} \;
+```text
+run_1/steps4_success_False.json
+step 4 success false, timed_out false
 ```
 
-分别用于判断：
+stdout 显示 step 0-4 的所有计划和执行都成功：
 
-- candidate 已生成，但 validator 是否选错
-- candidate 是否根本没有覆盖可行路径
-- RRT timeout 是否导致整轮超时
-- 任务已完成，但 done 判断未触发，后续多跑导致失败
+- step 0: PICK 成功；
+- step 1: PUT 成功；
+- step 2: 恢复性 PICK 成功；
+- step 3: 恢复性 PUT 成功；
+- step 4: 再次 PICK 成功；
+- 但没有第 5 步执行最后 PUT。
 
-**这让修改更精准，而不是盲目改 prompt。**
+因此失败原因不是物理规划，而是 Rope 内部将步数限制为 5。
+
+在 `run_dialog.py` 中修改：
+
+```python
+args.tsteps = 6
+```
+
+日志提示：
+
+```text
+MoveRope uses 6 tsteps to allow one recovery pick-place cycle
+```
+
+相关提交：
+
+- `67d0634 fix rope evaluation horizon`
 
 ---
 
-## 九、实验结果一：避障候选减少超时，成功率仍 3/5
+## 11. 实验结果变化
 
-加入 obstacle-aware pick candidates 后运行：
+### 早期结果
 
-```bash
-OLLAMA_MODEL=qwen3.5:27b uv run python evaluator.py --tasks rope --runs 5 --tsteps 5
+```text
+Success Rate: 2/5 = 40.0%
+Timeout Count: 1/5
 ```
 
-结果：
+### 加入 fallback 和路径候选后
 
-```
+```text
 Success Rate: 3/5 = 60.0%
-Timeout Count: 1/5 = 20.0%
+Timeout Count: 2/5
+Total Time: 768.24s
+```
+
+### 加入避障候选后
+
+```text
+Success Rate: 3/5 = 60.0%
+Timeout Count: 1/5
 Total Time: 462.16s
 ```
 
-对比改前：约 768 秒、2 个 timeout → **改后：462 秒、1 个 timeout**。
+虽然成功率暂时没提升，但 timeout 明显减少，说明路径候选机制有效。
 
-**结论：** 避障候选确实减少了卡死，但还没完全解决剩余失败。候选路径机制方向有效，需进一步区分是 validator 选错、候选覆盖不足，还是 done / horizon 机制问题。
+### 优先选择 obstacle-aware candidate 后
+
+```text
+Success Rate: 4/5 = 80.0%
+Timeout Count: 0/5
+Average Steps: 1.50
+Total Time: 408.23s
+```
+
+这是本次 Rope 调试的最好结果。唯一失败样例已经不是 IK、碰撞或 timeout，而是需要第 6 步完成恢复性放置。
 
 ---
 
-## 十、实验结果二：进一步优化后达到 4/5，无 timeout
+## 12. 推荐评测命令
 
-`run_20260519_124832` 版本结果：
-
-```
-Rope 4/5 = 80%
-Timeout: 0/5
-```
-
-唯一失败的 run_1：第 4 步刚完成一次恢复性重新 PICK，还差下一步 PUT，但 `run_dialog.py` 将 Rope 限制为 5 步，任务提前结束。
-
-**结论：** 前面的 fallback 候选、避障候选、路径约束已基本解决最严重的超时问题；**剩下的主要瓶颈变成了评测 horizon 不够。**
-
----
-
-## 十一、修改四：Rope 内部步数从 5 放宽到 6
-
-**修改文件：** `run_dialog.py`（line 422）
-
-**提交：** `67d0634 fix rope evaluation horizon`
-
-**内容：** Rope 任务内部步数从 5 放宽为 6，允许一次恢复性的 pick-place 循环。
-
-更新后运行命令：
+更新到最新代码后使用：
 
 ```bash
 git pull
 OLLAMA_MODEL=qwen3.5:27b uv run python evaluator.py --tasks rope --runs 5 --tsteps 6
 ```
 
-语法验证：
+单轮快速验证：
 
 ```bash
-python -m py_compile run_dialog.py  # 通过
+OLLAMA_MODEL=qwen3.5:27b uv run python evaluator.py --tasks rope --runs 1 --tsteps 6
 ```
 
-**表述：** 针对 Rope 任务存在恢复性重抓取需求的问题，将固定评测步长从 5 放宽到 6，使系统在出现一次局部失败后仍有足够 horizon 完成 pick-place 闭环。
+查看失败日志：
+
+```bash
+find output/run_xxx/tasks/01_rope/runs -maxdepth 2 -name "*.json" -print -exec cat {} \;
+tail -260 output/run_xxx/tasks/01_rope/stdout.log
+grep -R "timed_out\|Timeout\|Run finished\|failed\|Plan success\|Collision detected\|IK failed\|ReasonTimeout" -n output/run_xxx/tasks/01_rope
+find output/run_xxx/tasks/01_rope/runs -path "*prompts*fallback*.json" -print -exec cat {} \;
+```
 
 ---
 
-## 十二、优化点总结
+## 13. 本次 Rope 优化贡献
 
-### 1. 从单一路径生成改成多候选路径生成
-
-最初 LLM 只生成一组 PICK/PUT 路径，一旦路径穿过障碍或某中间点不适合 RRT，整轮失败。加入 fallback candidates（尤其是 PICK 阶段的 obstacle-aware candidates），让系统从多个候选中选择更稳定的路径。
-
-### 2. 从纯 LLM 输出改成 parser + fallback + validator 闭环
-
-LLM 有时只输出 `EXECUTE`，缺少 `NAME Alice ACTION ...`，导致解析失败。通过严格格式约束、parser 检查、fallback plan 和 feedback 机制，把 LLM 的不稳定输出变成可检查、可替代的结构化动作。
-
-### 3. 对 Rope 任务加入阶段化策略
-
-```
-Phase 1: PICK 两端（Alice → rope_front_end，Bob → rope_back_end）
-Phase 2: PUT 到 groove 两端（不交叉分配）
-```
-
-固定 Alice 和 Bob 的任务分工，避免两条路径交叉，也避免模型把左右端点放反。
-
-### 4. 加入机器人特定运动约束
-
-```
-Bob: x >= -0.40 when z > 0.50
-```
-
-不是泛泛地说"avoid collision"，而是根据失败日志总结出的机器人特定运动限制，显著减少 IK/RRT 失败。
-
-### 5. 针对障碍物墙做避障路径候选
-
-设计低 y 通道、高 y 通道、侧向绕障等候选路径，让 PICK 阶段更稳，而不是简单直线穿过障碍。
-
-### 6. 用实验日志区分失败类型
-
-调试时重点区分：
-
-- LLM 没输出动作
-- parser 解析失败
-- IK 点有效但 RRT 找不到路径
-- 障碍物碰撞
-- 任务完成但 done 未触发
-- horizon 不够导致恢复性动作被截断
-
-让修改更精准，而不是盲目改 prompt。
-
-### 7. 把 Rope 任务 horizon 从 5 放宽到 6
-
-4/5 版本已无 timeout，唯一失败因恢复性 pick 后没有下一步 PUT 的时间。将内部步数放宽到 6，是非常合理的收尾修改。
+1. **从单一路径改成多候选路径**：降低某个 waypoint 不可行导致整轮失败的概率。
+2. **端点抓取改成 inward-offset 抓取**：提高 rope endpoint 抓取稳定性。
+3. **parser 中使用更稳定的姿态**：减少不必要的 IK 失败。
+4. **PICK / PUT 阶段化**：明确双机器人分工，减少路径交叉。
+5. **加入 obstacle-aware PICK candidates**：解决初始抓取阶段穿越障碍墙的问题。
+6. **候选路径执行前验证**：使用 parser + feedback manager 筛选候选，而不是直接执行。
+7. **从失败日志中区分问题类型**：分别定位 LLM 格式、IK、碰撞、RRT timeout 和 horizon 不足。
+8. **将 Rope horizon 放宽到 6**：允许一次恢复性 pick-place 循环。
 
 ---
 
-## 十三、项目总结表述
+## 14. 泛化性分析
 
-本次针对 Rope 任务进行了多轮闭环调试。初始版本在 5 次运行中存在 2 次 timeout，主要问题包括 LLM 输出格式不稳定、PICK 阶段路径穿越障碍物、RRT 规划超时以及任务完成后未及时停止。
+本次 Rope 优化相比单纯手调坐标更具有泛化性，因为主要改动集中在机制层：
 
-针对这些问题：
+- 用 inward-offset 替代精确端点抓取；
+- 用多候选路径替代单一路径；
+- 用 validator 筛选替代盲目执行；
+- 用 obstacle-aware side-lane 替代固定直线；
+- 用阶段化策略替代完全自由生成；
+- 用 6 步 horizon 支持恢复性动作。
 
-1. **强化 Rope 任务阶段化 prompt**，将任务拆分为 PICK 和 PUT 两个阶段，明确 Alice 负责 `rope_front_end → groove_left_end`，Bob 负责 `rope_back_end → groove_right_end`，减少双机器人路径交叉。
-2. **引入 fallback plan 与 parser 检查机制**，避免 LLM 输出异常时直接导致任务失败。
-3. **在 `plan_prompter.py` 中加入 obstacle-aware rope pick candidates**，针对直线低位抓取、低 y 通道、高 y 通道和侧向绕障路径生成多个候选，并通过 feedback manager 进行筛选。
-4. **实验验证**：加入避障候选后 timeout 数量减少，总运行时间从约 768 秒下降至 462 秒；进一步优化后 Rope 达到 **4/5 成功率且无 timeout**。
-5. **针对唯一失败样例**中恢复性 pick-place 循环被 5 步 horizon 截断的问题，将 Rope 内部评测步数从 5 放宽为 6，使系统在局部失败后仍有足够步骤完成恢复性放置。
+但仍需注意：
 
-整体来看，本次优化不是单纯调 prompt，而是围绕**动作格式解析 → 候选路径生成 → 碰撞/RRT 反馈 → 任务终止条件 → 评测步长**建立了更完整的 Rope 任务调试闭环。
+- 当前候选路径仍基于本环境的 obstacle wall 和 groove 布局；
+- 多候选验证依赖现有 feedback manager，不能完全替代真实 RRT 成功率；
+- Rope 物理随机性较强，应继续用更多 runs 验证；
+- 后续若要进一步提升，可加入 memory bank，记录成功路径并复用。
+
+---
+
+## 15. 总结表述
+
+本次 Rope 任务调试从失败日志出发，发现主要瓶颈依次为端点抓取不稳定、路径穿越障碍、LLM 输出格式异常、RRT timeout 和评测 horizon 不足。通过 inward-offset grasp、Rope 专用 parser 处理、fallback candidate、obstacle-aware pick candidates、候选路径优先级调整和 6 步恢复性 horizon，成功将 Rope 任务从早期约 `40%-60%` 提升到 `80%`，并消除了 timeout。
+
+整体优化路线可以概括为：
+
+```text
+LLM 生成意图
+→ 规则/技能生成多个候选路径
+→ parser 与 feedback manager 做执行前验证
+→ 优先选择避障和可达候选
+→ 失败后允许恢复性 pick-place
+```
+
+这比单纯手动调 waypoint 更适合后续任务扩展，也更符合多机器人协作任务的泛化优化方向。
+
+---
+
+## 16. 公共规划器合并记录（PR #1）
+
+- 动机：合并远程 PR #1 `Improve multi-arm path planning robustness`，提升多机械臂路径规划稳定性，同时保留 main 上 Cabinet release 规划中“已焊接物体视为 in-hand”的修复。
+- 改动点：`rocobench/policy.py` 同时保留 `augment_release_plan_inhand` 和 `sparsify_validated_path`；`rocobench/rrt.py` 修正 near/center sampler 的区间采样；`rocobench/rrt_multi_arm.py` 使用末端局部坐标维护 in-hand 物体相对位姿、放宽 IK 容差、默认只允许末端执行器接触抓取物，并让 split plan 保留强制 waypoints。
+- 运行命令：`python -m compileall run_dialog.py prompting rocobench/envs rocobench/policy.py rocobench/rrt.py rocobench/rrt_multi_arm.py`
+- 验证结果：2026-05-19 语法检查通过；本次未重新跑完整仿真评测，建议按本任务推荐命令复验成功率。

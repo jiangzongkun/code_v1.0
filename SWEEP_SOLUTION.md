@@ -109,6 +109,13 @@ cat data/sweep_eval_10/run_0/step_*/prompts/fallback_*.json
 
 > 本实训基于 RoCoBench 的 Sweep 任务，沿用其 LLM 生成协作计划、环境反馈修正、RRT 路径规划和 MuJoCo 执行验证流程。针对清扫任务的同步性要求、角色分工和状态管理等问题，本文设计了三阶段状态机控制、角色专用动作限制、同步移动约束和状态验证反馈，以提升双机器人协同清扫任务的成功率和效率。
 
+## 公共规划器合并记录（PR #1）
+
+- 动机：合并远程 PR #1 `Improve multi-arm path planning robustness`，提升多机械臂路径规划稳定性，同时保留 main 上 Cabinet release 规划中“已焊接物体视为 in-hand”的修复。
+- 改动点：`rocobench/policy.py` 同时保留 `augment_release_plan_inhand` 和 `sparsify_validated_path`；`rocobench/rrt.py` 修正 near/center sampler 的区间采样；`rocobench/rrt_multi_arm.py` 使用末端局部坐标维护 in-hand 物体相对位姿、放宽 IK 容差、默认只允许末端执行器接触抓取物，并让 split plan 保留强制 waypoints。
+- 运行命令：`python -m compileall run_dialog.py prompting rocobench/envs rocobench/policy.py rocobench/rrt.py rocobench/rrt_multi_arm.py`
+- 验证结果：2026-05-19 语法检查通过；本次未重新跑完整仿真评测，建议按本任务推荐命令复验成功率。
+
 ## 引用
 
 ```bibtex

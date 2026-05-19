@@ -1,28 +1,69 @@
-# RocoBench 协作仓库
+# RocoBench 协作任务仓库
 
-本仓库用于多人协作提升 RoCoBench 六个任务的执行成功率。README 只保留公共运行方式和任务文档索引；各任务的优化细节、验证命令和结果记录在对应的 `*_SOLUTION.md` 中。
+本仓库用于改进 RoCoBench 多机器人协作任务的执行稳定性和成功率。各任务的具体优化思路、运行命令和验证记录统一写在对应的 `*_SOLUTION.md` 文件中。
 
 ## 环境准备
 
-本项目使用 `uv` 管理 Python 环境，并通过 `.python-version` 固定 Python 3.8。
-
-首次运行前执行：
+项目使用 Python 3.8。推荐通过 `uv` 管理环境：
 
 ```bash
 uv sync
 ```
 
-之后可以使用 `run_dialog.py` 运行单个任务：
+也可以使用已有 Python 环境直接运行：
 
 ```bash
-uv run python run_dialog.py --task sort --comm_mode plan --num_runs 1 --tsteps 3 --skip_display --run_name sort_smoke
+python run_dialog.py --task sort --comm_mode plan --num_runs 1 --tsteps 3 --skip_display --run_name sort_smoke
 ```
 
-第一次执行 `uv sync` 时，`uv` 会创建 `.venv` 虚拟环境；如果本机没有兼容的 Python 3.8，也会自动下载对应解释器。
+## LLM 配置
+
+默认通过 OpenAI-compatible 环境变量配置模型服务：
+
+```bash
+export OPENAI_BASE_URL=http://localhost:11434/v1
+export OPENAI_API_KEY=ollama
+export OPENAI_MODEL=Qwen/Qwen3.5-27B
+```
+
+如需本地个人客户端，可创建被 `.gitignore` 忽略的 `prompting/openai_client.py`。公共代码默认使用 `prompting/llm_client.py`，没有个人覆盖文件时也能运行。
+
+## 任务方案文档
+
+- [Sort](SORT_SOLUTION.md)
+- [Cabinet](CABINET_SOLUTION.md)
+- [Rope](ROPE_SOLUTION.md)
+- [Sweep](SWEEP_SOLUTION.md)
+- [Sandwich](SANDWICH_SOLUTION.md)
+- [Pack Grocery](PACK_GROCERY_SOLUTION.md)
+
+## Pack Grocery 最新更新
+
+Pack 任务的主要改动记录在 [PACK_GROCERY_SOLUTION.md](PACK_GROCERY_SOLUTION.md)。
+
+最新优化点：
+
+- 调整 Pack 任务的机器人-物品偏好：Alice 优先 `bread`、`banana`；Bob 优先 `milk`、`soda_can`、`cereal`、`apple`。
+- 保持每轮一个机器人执行 `PICK` 或 `PLACE`，另一个机器人 `WAIT`，降低箱口附近碰撞概率。
+- 新增 Pack fallback 候选方案队列。fallback 不再只返回一个贪心动作，而是生成多个候选动作并逐个通过 parser 和环境反馈验证。
+- 当某个候选在目标点发生碰撞，例如 `milk-Alice`，系统会自动尝试下一个候选，避免重复卡在同一个失败动作。
+- PLACE 阶段会尝试多个空槽位候选，减少固定槽位反复失败。
+
+Pack 快速运行命令：
+
+```bash
+python run_dialog.py --task pack --comm_mode plan --num_runs 1 --tsteps 12 --num_replans 1 --skip_display --run_name pack_eval_12 --rrt_timeout 15 --skip_smooth_path --pack_fallback_first
+```
+
+使用 `uv`：
+
+```bash
+uv run python run_dialog.py --task pack --comm_mode plan --num_runs 1 --tsteps 12 --num_replans 1 --skip_display --run_name pack_eval_12 --rrt_timeout 15 --skip_smooth_path --pack_fallback_first
+```
 
 ## 输出目录
 
-`run_dialog.py` 默认把运行产物写入 `data/<run_name>/`：
+`run_dialog.py` 默认将运行产物写入 `data/<run_name>/`。部分批量评测脚本也可能写入 `output/<run_name>/`。
 
 ```text
 data/<run_name>/
@@ -33,76 +74,72 @@ data/<run_name>/
     `-- *.html / *.mp4
 ```
 
-`data/`、`output/`、视频、日志和中间 pickle 都是本地产物，已被 `.gitignore` 忽略。
+`data/`、`output/`、视频、日志和中间 pickle 均为本地产物，应保持在 `.gitignore` 中，不提交到远程仓库。
 
-## LLM 配置
+## 常用检查命令
 
-默认通过环境变量配置 OpenAI-compatible 接口：
+语法检查：
 
 ```bash
-export OPENAI_BASE_URL=http://localhost:11434/v1
-export OPENAI_API_KEY=ollama
-export OPENAI_MODEL=Qwen/Qwen3.5-27B
+python -m py_compile prompting/plan_prompter.py
 ```
 
-如需个人化客户端，可在本地创建被 `.gitignore` 忽略的 `prompting/openai_client.py`。公共代码默认使用 `prompting/llm_client.py`，没有个人覆盖文件时也能直接运行。
+批量编译主要模块：
 
-## 任务方案
+```bash
+python -m compileall run_dialog.py prompting rocobench
+```
 
-- [Sort](SORT_SOLUTION.md)
-- [Cabinet](CABINET_SOLUTION.md)
-- [Rope](ROPE_SOLUTION.md)
-- [Sweep](SWEEP_SOLUTION.md)
-- [Sandwich](SANDWICH_SOLUTION.md)
-- [Pack Grocery](PACK_GROCERY_SOLUTION.md)
+查看 Pack fallback 日志：
 
-## 评测入口
+```bash
+find output/run_20260519_153732/tasks/01_pack/runs -path "*prompts*fallback*.json" -print -exec cat {} \;
+```
 
-远程仓库不再维护 `evaluator.py` / `evaluate.py`，这类批量评测脚本按个人环境本地创建并被 `.gitignore` 忽略。公共复现入口是 `run_dialog.py`；任务相关推荐命令写在对应的 `*_SOLUTION.md` 中。
+查看 Pack 碰撞反馈：
 
-## 单任务运行
+```bash
+grep -R "Collision detected\|FallbackCandidates\|SelectedFallback" -n output/run_20260519_153732/tasks/01_pack/runs
+```
 
-直接运行单个 rollout：
+## 单任务运行示例
+
+Sort：
 
 ```bash
 uv run python run_dialog.py --task sort --comm_mode plan --num_runs 1 --tsteps 8 --num_replans 2 --skip_display --skip_smooth_path --fallback_first --run_name sort_debug
 ```
 
-运行结果会保存在：
+Pack：
 
-```text
-data/sort_debug/
+```bash
+uv run python run_dialog.py --task pack --comm_mode plan --num_runs 1 --tsteps 12 --num_replans 1 --skip_display --skip_smooth_path --pack_fallback_first --run_name pack_debug
 ```
-
-批量评测如需汇总多个任务，可在本地创建被忽略的 `evaluator.py` 调用这些命令，不要提交到远程仓库。
 
 ## 协作规则
 
-提交前请阅读 [AGENTS.md](AGENTS.md)。远程仓库不得包含个人密钥、代理配置、运行产物、个人 LLM 客户端或只适配单人环境的 runner/evaluator 改动。
+提交前请阅读 [AGENTS.md](AGENTS.md)。
 
-## pack_code.sh 使用方法
+远程仓库不应包含：
 
-`pack_code.sh` 用于按照 `.gitignore` 规则打包当前工作区。
+- 个人密钥或代理配置
+- 个人 LLM 客户端覆盖文件
+- 本地 runner / evaluator 临时脚本
+- `data/`、`output/`、视频、日志、pickle 等运行产物
+- 与当前任务无关的临时文件
+
+## pack_code.sh
+
+`pack_code.sh` 用于按 `.gitignore` 规则打包当前工作区：
 
 ```bash
-# 使用默认文件名 code_YYYYMMDD_HHMMSS.zip
 ./pack_code.sh
-
-# 指定输出文件名
 ./pack_code.sh myproject.zip
-
-# 未写 .zip 后缀时会自动补全
 ./pack_code.sh myproject
 ```
 
-如果脚本没有执行权限，先运行：
+如果没有执行权限：
 
 ```bash
 chmod +x pack_code.sh
 ```
-
-## 注意事项
-
-- 本项目默认使用 `uv run` 启动 Python 脚本。
-- 使用本地 Ollama 模型时，需要提前确认模型已经拉取并启动服务。
-- 任务相关优化、风险和验证结果统一记录在对应 `*_SOLUTION.md` 中。
