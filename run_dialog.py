@@ -3,6 +3,7 @@ import pickle
 import json
 import numpy as np
 import logging
+import re
 import time
 from datetime import datetime
 from glob import glob
@@ -29,6 +30,50 @@ TASK_NAME_MAP = {
     "sandwich": MakeSandwichTask,
     "pack": PackGroceryTask,
 }
+
+
+RUN_DIR_PATTERN = re.compile(r"^run_(?P<run_id>\d+)(?:_seed_(?P<seed>-?\d+))?$")
+
+
+def seed_for_run(base_seed: int, run_id: int) -> int:
+    return base_seed + run_id
+
+
+def format_run_dir_name(run_id: int, run_seed: int) -> str:
+    return f"run_{run_id}_seed_{run_seed}"
+
+
+def parse_run_id(path: str):
+    match = RUN_DIR_PATTERN.match(os.path.basename(path))
+    if match is None:
+        return None
+    return int(match.group("run_id"))
+
+
+def parse_run_seed(path: str):
+    match = RUN_DIR_PATTERN.match(os.path.basename(path))
+    if match is None or match.group("seed") is None:
+        return None
+    return int(match.group("seed"))
+
+
+def find_run_dir(data_dir: str, run_name: str, run_id: int, run_seed: int = None):
+    run_parent = os.path.join(data_dir, run_name)
+    candidates = []
+    if run_seed is not None:
+        candidates.append(os.path.join(run_parent, format_run_dir_name(run_id, run_seed)))
+    candidates.append(os.path.join(run_parent, f"run_{run_id}"))
+    candidates.extend(natsorted(glob(os.path.join(run_parent, f"run_{run_id}_seed_*"))))
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
 
 class LLMRunner:
     def __init__(
@@ -157,6 +202,16 @@ class LLMRunner:
             )
 
 
+    def get_run_seed(self, run_id: int) -> int:
+        return seed_for_run(self.np_seed, run_id)
+
+
+    def get_run_dir(self, run_id: int, run_seed: int = None) -> str:
+        if run_seed is None:
+            run_seed = self.get_run_seed(run_id)
+        return os.path.join(self.run_dir, format_run_dir_name(run_id, run_seed))
+
+
     def display_plan(self, plan: LLMPathPlan, save_name = "vis_plan", save_dir = None):
         """ Display the plan in the open3d viewer """ 
         env = deepcopy(self.env)
@@ -175,19 +230,23 @@ class LLMRunner:
             )
         
 
-    def one_run(self, run_id: int = 0, start_step: int = 0, skip_reset = False, prev_llm_plans = [], prev_response = None, prev_actions = None):
+    def one_run(self, run_id: int = 0, start_step: int = 0, skip_reset = False, prev_llm_plans = [], prev_response = None, prev_actions = None, run_seed: int = None, save_dir: str = None):
         """ uses planner """
         # Record start time for timeout detection
         run_start_time = time.time()
-        
-        self.env.seed(np_seed=run_id)
+
+        if run_seed is None:
+            run_seed = self.get_run_seed(run_id)
         if not skip_reset:
+            self.env.seed(np_seed=run_seed)
             self.env.reset(reload=True) # NOTE: need to do this to reset the model.eq_active vals
         env = self.env
         physics = env.physics
         success = False
-        save_dir = os.path.join(self.run_dir, f"run_{run_id}")
+        if save_dir is None:
+            save_dir = self.get_run_dir(run_id, run_seed)
         os.makedirs(save_dir, exist_ok=self.overwrite)
+        print(f"Run {run_id} using seed {run_seed}")
 
         done = False
         reward = 0
@@ -198,7 +257,7 @@ class LLMRunner:
             # Check if timeout exceeded
             elapsed_time = time.time() - run_start_time
             if elapsed_time > self.run_timeout:
-                print(f"Run {run_id} TIMED OUT after {elapsed_time:.2f} seconds (limit: {self.run_timeout}s)")
+                print(f"Run {run_id} seed {run_seed} TIMED OUT after {elapsed_time:.2f} seconds (limit: {self.run_timeout}s)")
                 timed_out = True
                 break
 
@@ -328,12 +387,12 @@ class LLMRunner:
         
         elapsed_time = time.time() - run_start_time
         json.dump(
-            dict(step=step, success=success, timed_out=timed_out, elapsed_time=elapsed_time),
+            dict(run_id=run_id, seed=run_seed, step=step, success=success, timed_out=timed_out, elapsed_time=elapsed_time),
             open(f"{save_dir}/steps{step}_success_{success}.json", "w"),
         )
         
         if timed_out:
-            print(f"Run {run_id} FAILED due to timeout after {elapsed_time:.2f}s")
+            print(f"Run {run_id} seed {run_seed} FAILED due to timeout after {elapsed_time:.2f}s")
         else:
             print("Run finished after {} timesteps in {:.2f}s".format(step, elapsed_time))
         self.prompter.post_episode_update()
@@ -350,11 +409,18 @@ class LLMRunner:
         start_id = 0 if args.start_id == -1 else args.start_id
         if args.cont:
             logging.info("Continuing from previous run")
-            load_run = glob(os.path.join(self.data_dir, args.load_run_name, f"run_{args.load_run_id}"))
-            if len(load_run) == 0:
+            load_run = find_run_dir(
+                self.data_dir,
+                args.load_run_name,
+                args.load_run_id,
+                self.get_run_seed(args.load_run_id),
+            )
+            if load_run is None:
                 raise ValueError(f"Cannot find run {args.load_run_id} in {args.load_run_name}")
                 exit()
-            load_run = load_run[0]
+            load_run_seed = parse_run_seed(load_run)
+            if load_run_seed is None:
+                load_run_seed = self.get_run_seed(args.load_run_id)
             # find the latest steps
             step_dirs = natsorted(
                 glob(os.path.join(load_run, "step_*"))
@@ -395,16 +461,20 @@ class LLMRunner:
                 skip_reset=True,
                 prev_llm_plans=prev_llm_plans,
                 prev_response=prev_response,
-                prev_actions=prev_actions
+                prev_actions=prev_actions,
+                run_seed=load_run_seed,
+                save_dir=load_run,
                 )
             start_id = args.load_run_id + 1
         existing_runs = glob(os.path.join(self.data_dir, args.run_name, "run_*"))
         if args.start_id == -1 and len(existing_runs) > 0:
-            existing_run_ids = [int(run.split("_")[-1]) for run in existing_runs]
-            start_id = max(existing_run_ids) + 1
+            existing_run_ids = [run_id for run_id in (parse_run_id(run) for run in existing_runs) if run_id is not None]
+            if len(existing_run_ids) > 0:
+                start_id = max(existing_run_ids) + 1
         for run_id in range(start_id, start_id + self.num_runs):
-            print(f"==== Run {run_id} starts ====")
-            self.one_run(run_id)
+            run_seed = self.get_run_seed(run_id)
+            print(f"==== Run {run_id} seed {run_seed} starts ====")
+            self.one_run(run_id, run_seed=run_seed)
 
 def main(args):
     assert args.task in TASK_NAME_MAP.keys(), f"Task {args.task} not supported"
@@ -466,6 +536,7 @@ def main(args):
         robots=robots,
         max_runner_steps=args.tsteps,
         num_runs=args.num_runs,
+        np_seed=args.seed,
         run_name=args.run_name,
         overwrite=True,
         skip_display=args.skip_display,
