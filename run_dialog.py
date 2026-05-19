@@ -401,15 +401,23 @@ class LLMRunner:
             for i, plan in enumerate(current_llm_plan):
                 print('tograsp:', plan.tograsp, 'inhand:', plan.inhand, plan.action_strs)
                 monitor.update("rrt_policy_init", step=step, plan_index=i)
-                policy = PlannedPathPolicy(
-                    physics=env.physics,
-                    robots=self.robots,
-                    path_plan=plan,
-                    graspable_object_names=self.env.get_graspable_objects(),
-                    allowed_collision_pairs=self.env.get_allowed_collision_pairs(),
-                    plan_splitted=self.split_parsed_plans,
-                    **self.policy_kwargs,
-                )
+                try:
+                    policy = PlannedPathPolicy(
+                        physics=env.physics,
+                        robots=self.robots,
+                        path_plan=plan,
+                        graspable_object_names=self.env.get_graspable_objects(),
+                        allowed_collision_pairs=self.env.get_allowed_collision_pairs(),
+                        plan_splitted=self.split_parsed_plans,
+                        **self.policy_kwargs,
+                    )
+                except Exception as exc:
+                    reason = f"policy initialization failed: {exc}"
+                    monitor.update("rrt_policy_init_error", step=step, plan_index=i, error=repr(exc))
+                    logging.info(f"Stesp: {step} Plan success: False, reason: {reason}")
+                    print(f"Plan {i} failed before RRT planning: {reason}")
+                    rewind_env = True
+                    break
 
                 num_sim_steps = 0
                 if prev_actions is not None:
