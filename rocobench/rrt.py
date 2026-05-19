@@ -10,6 +10,7 @@ DistanceFunc = Callable[[np.ndarray, np.ndarray], float]
 SampleFunc = Callable[[], np.ndarray]
 ExtendFunc = Callable[[np.ndarray, np.ndarray], List[np.ndarray]]
 CollisionFunc = Callable[[np.ndarray], bool]
+MotionValidatorFunc = Callable[[np.ndarray, np.ndarray], bool]
 
 
 def irange(start, stop=None, step=1):  # np.arange
@@ -58,6 +59,7 @@ def smooth_path(
     collision_fn: CollisionFunc,
     np_random: np.random.RandomState,
     iterations: int = 50,
+    motion_validator: Optional[MotionValidatorFunc] = None,
 ):
     smoothed_path = path
     for _ in range(iterations):
@@ -70,7 +72,12 @@ def smooth_path(
         if j < i:
             i, j = j, i
         shortcut = list(extend_fn(smoothed_path[i], smoothed_path[j]))
-        if (len(shortcut) < (j - i)) and all(not collision_fn(q) for q in shortcut):
+        valid_shortcut = (
+            motion_validator(smoothed_path[i], smoothed_path[j])
+            if motion_validator is not None
+            else all(not collision_fn(q) for q in shortcut)
+        )
+        if (len(shortcut) < (j - i)) and valid_shortcut:
             smoothed_path = smoothed_path[: i + 1] + shortcut + smoothed_path[j + 1 :]
     return smoothed_path
 
@@ -124,6 +131,7 @@ def rrt(
     iterations: int = 2000,
     goal_probability: float = 0.2,
     greedy: bool = True,
+    motion_validator: Optional[MotionValidatorFunc] = None,
 ) -> Optional[List[np.ndarray]]:
     """
     RRT algorithm
@@ -154,7 +162,11 @@ def rrt(
             distance_fn=distance_fn, target=current_target, nodes=nodes
         )
         for q in extend_fn(last.config, current_target):
-            if collision_fn(q):
+            if motion_validator is not None:
+                invalid = not motion_validator(last.config, q)
+            else:
+                invalid = collision_fn(q)
+            if invalid:
                 break
             last = TreeNode(q, parent=last)
             nodes.append(last)
@@ -182,6 +194,7 @@ def rrt_connect(
     timeout: float,
     debug: bool = False,
     skip_start_collision_check: bool = True,
+    motion_validator: Optional[MotionValidatorFunc] = None,
 ):    
     if not skip_start_collision_check:
         if collision_fn(q1):
@@ -212,7 +225,11 @@ def rrt_connect(
             distance_fn=distance_fn, target=current_target, nodes=nodes1
         )
         for q in extend_fn(last1.config, current_target):
-            if collision_fn(q): 
+            if motion_validator is not None:
+                invalid = not motion_validator(last1.config, q)
+            else:
+                invalid = collision_fn(q)
+            if invalid:
                 break
             last1 = TreeNode(q, parent=last1)
             nodes1.append(last1)
@@ -224,7 +241,11 @@ def rrt_connect(
         )
 
         for q in extend_fn(last2.config, last1.config):
-            if collision_fn(q):
+            if motion_validator is not None:
+                invalid = not motion_validator(last2.config, q)
+            else:
+                invalid = collision_fn(q)
+            if invalid:
                 break
             last2 = TreeNode(q, parent=last2)
             nodes2.append(last2)
@@ -243,12 +264,21 @@ def rrt_connect(
 
 
 def direct_path(
-    q1: np.ndarray, q2: np.ndarray, extend_fn: ExtendFunc, collision_fn: CollisionFunc
+    q1: np.ndarray,
+    q2: np.ndarray,
+    extend_fn: ExtendFunc,
+    collision_fn: CollisionFunc,
+    motion_validator: Optional[MotionValidatorFunc] = None,
 ):
     if collision_fn(q1) or collision_fn(q2):
         return None
+    if motion_validator is not None:
+        if not motion_validator(q1, q2):
+            return None
+        return [q1] + list(extend_fn(q1, q2))
+    extended = list(extend_fn(q1, q2))
     path = [q1]
-    for q in extend_fn(q1, q2):
+    for q in extended:
         if collision_fn(q):
             return None
         path.append(q)
@@ -270,11 +300,18 @@ def birrt(
     smooth_extend_fn: Optional[ExtendFunc] = None,
     skip_direct_path: bool = False,
     skip_smooth_path: bool = False,
+    motion_validator: Optional[MotionValidatorFunc] = None,
 ) -> Tuple:
 
     if not skip_direct_path:
         start_time = time()
-        path = direct_path(start_conf, goal_conf, extend_fn, collision_fn)
+        path = direct_path(
+            start_conf,
+            goal_conf,
+            extend_fn,
+            collision_fn,
+            motion_validator=motion_validator,
+        )
         if path is not None:
             return path, f"ReasonDirect_time{time() - start_time}_iter1"
 
@@ -288,6 +325,7 @@ def birrt(
         iterations=iterations,
         greedy=greedy,
         timeout=timeout,
+        motion_validator=motion_validator,
     )
     if path is not None and not skip_smooth_path:
         path = smooth_path(
@@ -296,6 +334,7 @@ def birrt(
             collision_fn=collision_fn,
             np_random=np_random,
             iterations=smooth_iterations,
+            motion_validator=motion_validator,
         )
         info += '_smoothed'
     return path, info 
@@ -358,7 +397,7 @@ class NearJointsUniformSampler(RRTSampler):
             self.init_samples
         ):
             self.curr_sample_idx += 1 
-            print(f'init-sampling! {self.curr_sample_idx}')
+            logging.debug(f'init-sampling! {self.curr_sample_idx}')
             return self.init_samples[self.curr_sample_idx - 1]
         # if self.curr_sample_idx < len(self.init_samples):
         #     self.curr_sample_idx += 1
@@ -391,7 +430,7 @@ class CenterWaypointsUniformSampler(RRTSampler):
             self.init_samples
         ):
             self.curr_sample_idx += 1 
-            print(f'init-sampling! {self.curr_sample_idx}')
+            logging.debug(f'init-sampling! {self.curr_sample_idx}')
             return self.init_samples[self.curr_sample_idx - 1]
         
         # if self.numpy_random.random() > 0.8 and len(self.init_samples) > 0:

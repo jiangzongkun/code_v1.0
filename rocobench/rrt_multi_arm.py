@@ -19,17 +19,18 @@ class MultiArmRRT:
     def __init__(
         self,
         physics,
-        robots: Dict[str, SimRobot] = {},
-        robot_configs: Dict[str, Dict[str, Any]] = {},
+        robots: Optional[Dict[str, SimRobot]] = None,
+        robot_configs: Optional[Dict[str, Dict[str, Any]]] = None,
         seed: int = 0,
         graspable_object_names: Optional[Union[Dict[str, str], List[str]]] = None,
-        allowed_collision_pairs: List[Tuple[int, int]] = [],
+        allowed_collision_pairs: Optional[List[Tuple[int, int]]] = None,
         inhand_object_info: Optional[Dict[str, Tuple]] = None,
     ):
-        self.robots = robots
-        if len(robots) == 0:
+        self.robots = {} if robots is None else robots
+        robot_configs = {} if robot_configs is None else robot_configs
+        if len(self.robots) == 0:
             assert len(robot_configs) > 0, "No robot config is passed in"
-            print(
+            logging.warning(
                 "Warning: No robot is passed in, will use robot_configs to create robots"
             )
         
@@ -43,8 +44,13 @@ class MultiArmRRT:
         self.all_joint_idxs_in_qpos = []
         self.all_collision_link_names = []
         self.inhand_object_info = dict()
+        self.robot_joint_slices = {}
 
+        cursor = 0
         for name, robot in self.robots.items():
+            width = len(robot.joint_idxs_in_qpos)
+            self.robot_joint_slices[name] = slice(cursor, cursor + width)
+            cursor += width
             self.all_joint_names.extend(
                 robot.ik_joint_names
             ) 
@@ -74,7 +80,7 @@ class MultiArmRRT:
             elif type(graspable_object_names) is list:
                 graspable_name_dict[robot_name] = graspable_object_names
 
-        self.allowed_collision_pairs = allowed_collision_pairs
+        self.allowed_collision_pairs = [] if allowed_collision_pairs is None else allowed_collision_pairs
         self.set_ungraspable(graspable_name_dict)
     
     def set_inhand_info(self, physics, inhand_object_info: Optional[Dict[str, Tuple]] = None):
@@ -95,8 +101,9 @@ class MultiArmRRT:
                         mjsite = physics.data.site(site_name)
                         qpos_slice = physics.named.data.qpos._convert_key(joint_name) 
                     except: 
-                        print(f"Error: site_name: {site_name} joint_name {joint_name} not found in mujoco model")
-                        breakpoint() 
+                        raise ValueError(
+                            f"site_name: {site_name} joint_name {joint_name} not found in mujoco model"
+                        )
                     self.inhand_object_info[name] = (body_name, site_name, joint_name, (qpos_slice.start, qpos_slice.stop))
         return 
 
@@ -145,7 +152,7 @@ class MultiArmRRT:
                 robot_ungraspable += [
                     body.id for body in all_bodies if body.rootid[0] not in graspable_ids
                 ]
-                self.ungraspable_body_ids[robot_name] = set(ungraspable_ids)
+                self.ungraspable_body_ids[robot_name] = set(robot_ungraspable)
             # breakpoint()
 
     def forward_kinematics_all(
@@ -314,6 +321,104 @@ class MultiArmRRT:
 
         return accepted_result
 
+    def score_ik_qpos(
+        self,
+        qpos: np.ndarray,
+        reference_qpos: Optional[np.ndarray] = None,
+    ) -> float:
+        qpos = np.asarray(qpos)
+        if reference_qpos is None:
+            reference_qpos = self.physics.data.qpos[self.all_joint_idxs_in_qpos]
+        elif len(reference_qpos) != len(self.all_joint_idxs_in_qpos):
+            reference_qpos = reference_qpos[self.all_joint_idxs_in_qpos]
+        reference_qpos = np.asarray(reference_qpos)
+
+        delta = np.abs(qpos - reference_qpos)
+        range_safe = np.maximum(self.joint_ranges, 1e-6)
+        normalized_delta = delta / range_safe
+        low, high = self.joint_minmax[:, 0], self.joint_minmax[:, 1]
+        normalized_margin = np.minimum(qpos - low, high - qpos) / range_safe
+        limit_penalty = np.mean(np.maximum(0.0, 0.1 - normalized_margin))
+        return (
+            float(np.max(normalized_delta))
+            + 0.25 * float(np.linalg.norm(normalized_delta))
+            + 0.5 * float(limit_penalty)
+        )
+
+    def solve_ik_candidates(
+        self,
+        physics,
+        site_name,
+        target_pos,
+        target_quat,
+        joint_names,
+        tol=1e-6,
+        max_steps=300,
+        max_resets=24,
+        qpos_idxs=None,
+        allow_grasp=True,
+        check_grasp_ids=None,
+        check_relative_pose=False,
+        num_candidates: int = 4,
+        reference_qpos: Optional[np.ndarray] = None,
+    ) -> List[Tuple[float, np.ndarray]]:
+        physics_cp = physics.copy(share_model=True)
+        candidates = []
+
+        def reset_fn(physics):
+            model = physics.named.model
+            _lower, _upper = model.jnt_range[joint_names].T
+            curr_qpos = physics.named.data.qpos[joint_names]
+            new_qpos = self.np_random.uniform(low=curr_qpos - 0.5, high=curr_qpos + 0.5)
+            physics.named.data.qpos[joint_names] = np.clip(new_qpos, _lower, _upper)
+            physics.forward()
+
+        for i in range(max_resets):
+            if i > 0:
+                reset_fn(physics_cp)
+
+            result = qpos_from_site_pose(
+                physics=physics_cp,
+                site_name=site_name,
+                target_pos=target_pos,
+                target_quat=target_quat,
+                joint_names=joint_names,
+                tol=tol,
+                max_steps=max_steps,
+                inplace=True,
+            )
+            if not result.success or qpos_idxs is None:
+                continue
+
+            if not self.check_joint_range(physics_cp, joint_names, qpos_idxs, result):
+                continue
+
+            candidate_full_qpos = result.qpos.copy()
+            _low, _high = physics_cp.named.model.jnt_range[joint_names].T
+            candidate_full_qpos[qpos_idxs] = np.clip(
+                candidate_full_qpos[qpos_idxs],
+                _low,
+                _high,
+            )
+            candidate_joint_qpos = candidate_full_qpos[self.all_joint_idxs_in_qpos]
+            if self.check_collision(
+                physics=physics_cp,
+                robot_qpos=candidate_joint_qpos,
+                check_grasp_ids=check_grasp_ids,
+                allow_grasp=allow_grasp,
+                check_relative_pose=check_relative_pose,
+            ):
+                continue
+
+            robot_qpos = candidate_full_qpos[qpos_idxs].copy()
+            if any(np.allclose(robot_qpos, existing[1], atol=1e-4) for existing in candidates):
+                continue
+            score = self.score_ik_qpos(candidate_joint_qpos, reference_qpos=reference_qpos)
+            candidates.append((score, robot_qpos))
+
+        candidates.sort(key=lambda item: item[0])
+        return candidates[:num_candidates]
+
     def inverse_kinematics_all(
         self,
         physics,
@@ -362,15 +467,98 @@ class MultiArmRRT:
                 results[robot_name] = None
         return results      
 
+    def inverse_kinematics_all_candidates(
+        self,
+        physics,
+        ee_poses: Dict[str, Pose],
+        allow_grasp=True,
+        check_grasp_ids=None,
+        check_relative_pose=False,
+        num_candidates: int = 3,
+        per_robot_top_k: int = 3,
+        max_combined_candidates: int = 3,
+        reference_qpos: Optional[np.ndarray] = None,
+    ) -> List[Tuple[Dict[str, Tuple[np.ndarray, List[int]]], np.ndarray, float]]:
+        if physics is None:
+            physics = self.physics
+        physics = physics.copy(share_model=True)
+        if reference_qpos is None:
+            reference_qpos = physics.data.qpos[self.all_joint_idxs_in_qpos]
+        elif len(reference_qpos) != len(self.all_joint_idxs_in_qpos):
+            reference_qpos = reference_qpos[self.all_joint_idxs_in_qpos]
+
+        per_robot_candidates = {}
+        for robot_name, target_ee in ee_poses.items():
+            assert robot_name in self.robots, f"robot_name: {robot_name} not in self.robots"
+            robot = self.robots[robot_name]
+            quat = target_ee.orientation
+            if robot.use_ee_rest_quat:
+                quat = quaternions.qmult(quat, robot.ee_rest_quat)
+            candidates = self.solve_ik_candidates(
+                physics=physics,
+                site_name=robot.ee_site_name,
+                target_pos=target_ee.position,
+                target_quat=quat,
+                joint_names=robot.ik_joint_names,
+                tol=1e-6,
+                max_steps=300,
+                qpos_idxs=robot.joint_idxs_in_qpos,
+                allow_grasp=allow_grasp,
+                check_grasp_ids=check_grasp_ids,
+                check_relative_pose=check_relative_pose,
+                num_candidates=max(num_candidates, per_robot_top_k),
+                reference_qpos=reference_qpos,
+            )
+            if len(candidates) == 0:
+                return []
+            per_robot_candidates[robot_name] = [
+                (score, qpos, robot.joint_idxs_in_qpos)
+                for score, qpos in candidates[:per_robot_top_k]
+            ]
+
+        beam = [(physics.data.qpos.copy(), {}, 0.0)]
+        for robot_name in ee_poses.keys():
+            next_beam = []
+            for full_qpos, result_dict, base_score in beam:
+                for score, robot_qpos, qpos_idxs in per_robot_candidates[robot_name]:
+                    candidate_full_qpos = full_qpos.copy()
+                    candidate_full_qpos[qpos_idxs] = robot_qpos
+                    candidate_joint_qpos = candidate_full_qpos[self.all_joint_idxs_in_qpos]
+                    if not self.is_state_valid(
+                        candidate_joint_qpos,
+                        physics=physics,
+                        allow_grasp=allow_grasp,
+                        check_grasp_ids=check_grasp_ids,
+                        check_relative_pose=check_relative_pose,
+                    ):
+                        continue
+                    combined_results = dict(result_dict)
+                    combined_results[robot_name] = (robot_qpos.copy(), qpos_idxs)
+                    combined_score = (
+                        base_score
+                        + score
+                        + self.score_ik_qpos(candidate_joint_qpos, reference_qpos=reference_qpos)
+                    )
+                    next_beam.append((candidate_full_qpos, combined_results, combined_score))
+            if len(next_beam) == 0:
+                return []
+            beam = sorted(next_beam, key=lambda item: item[2])[:max_combined_candidates]
+
+        return [
+            (result_dict, full_qpos, score)
+            for full_qpos, result_dict, score in beam[:max_combined_candidates]
+        ]
+
 
     def ee_l2_distance(
         self, 
         q1: np.ndarray, 
         q2: np.ndarray, 
-        orientation_factor: float = 0.2
+        orientation_factor: float = 0.2,
+        physics=None,
     ) -> float: 
-        pose1s = self.forward_kinematics_all(q1, return_ee_pose=True) # {robotA: Pose1, robotB: Pose1}
-        pose2s = self.forward_kinematics_all(q2, return_ee_pose=True) # {robotA: Pose2, robotB: Pose2}
+        pose1s = self.forward_kinematics_all(q1, physics=physics, return_ee_pose=True) # {robotA: Pose1, robotB: Pose1}
+        pose2s = self.forward_kinematics_all(q2, physics=physics, return_ee_pose=True) # {robotA: Pose2, robotB: Pose2}
         assert pose1s is not None and pose2s is not None
         dist = 0
 
@@ -381,17 +569,60 @@ class MultiArmRRT:
             dist += pose1.distance(pose2, orientation_factor=orientation_factor)
         return dist
 
+    def compute_motion_steps(
+        self,
+        q1: np.ndarray,
+        q2: np.ndarray,
+        ee_resolution: float = 0.006,
+        joint_resolution: float = 0.08,
+        max_steps: int = 200,
+        physics=None,
+    ) -> int:
+        ee_dist = self.ee_l2_distance(q1, q2, physics=physics)
+        joint_dist = float(np.max(np.abs(q2 - q1))) if len(q1) > 0 else 0.0
+        n_ee = int(np.ceil(ee_dist / ee_resolution)) if ee_dist > 0 else 0
+        n_joint = int(np.ceil(joint_dist / joint_resolution)) if joint_dist > 0 else 0
+        n_steps = max(1, n_ee, n_joint)
+
+        if any(obj_info is not None for obj_info in self.inhand_object_info.values()):
+            n_steps *= 2
+
+        moving_robots = 0
+        cursor = 0
+        for robot in self.robots.values():
+            width = len(robot.joint_idxs_in_qpos)
+            joint_delta = np.abs(q2[cursor:cursor + width] - q1[cursor:cursor + width])
+            if len(joint_delta) > 0 and np.max(joint_delta) > 1e-5:
+                moving_robots += 1
+            cursor += width
+        if moving_robots > 1:
+            n_steps = int(np.ceil(n_steps * 1.5))
+
+        return max(1, min(max_steps, n_steps))
+
     def extend_ee_l2(
         self, 
         q1: np.ndarray, 
         q2: np.ndarray, 
-        resolution: float = 0.006
+        resolution: float = 0.006,
+        joint_resolution: float = 0.08,
+        adaptive: bool = True,
+        physics=None,
     ) -> List[np.ndarray]:
-        dist = self.ee_l2_distance(q1, q2)
-        if dist == 0:
+        if np.allclose(q1, q2):
             return []
-        step = resolution / dist
-        return [(q2 - q1) * np.clip(t, 0, 1) + q1 for t in np.arange(0, 1 + step, step)]
+        if adaptive:
+            n_steps = self.compute_motion_steps(
+                q1,
+                q2,
+                ee_resolution=resolution,
+                joint_resolution=joint_resolution,
+                physics=physics,
+            )
+        else:
+            dist = self.ee_l2_distance(q1, q2, physics=physics)
+            n_steps = max(1, int(np.ceil(dist / resolution)))
+        return [q1 + (q2 - q1) * (i / n_steps) for i in range(1, n_steps + 1)]
 
     def allow_collision_pairs(
         self,
@@ -495,7 +726,7 @@ class MultiArmRRT:
         # if np.linalg.norm(physics.data.body('red_cube').xpos  - physics.data.body('dustpan').xpos) < 0.1:
         # if 54 in collided_id1 or 54 in collided_id2:
         if len(undesired_ids) > 0 and show:
-            print(bad_pairs)
+            logging.info(bad_pairs)
             img_arr = np.concatenate(
                 [
                      physics.render(camera_id=i, height=400, width=400,) for i in range(3)
@@ -506,8 +737,7 @@ class MultiArmRRT:
             plt.show()
             
             qpos_str = " ".join(physics.data.qpos.astype(str))
-            print(f"<key name='rrt_check' qpos='{qpos_str}'/>")
-            breakpoint()
+            logging.info(f"<key name='rrt_check' qpos='{qpos_str}'/>")
            
         return bad_pairs
     
@@ -518,6 +748,8 @@ class MultiArmRRT:
     ):  
         # get ee poses from qpos?
         poses_dict = self.forward_kinematics_all(q=qpos, physics=physics, return_ee_pose=True) # {robotA: Pose1, robotB: Pose1}
+        if poses_dict is None or "Alice" not in poses_dict or "Bob" not in poses_dict:
+            return True
         alice_quat = np.array([7.07106781e-01, 1.73613722e-16, 1.69292055e-16, 7.07106781e-01])
         bob_quat = np.array([7.07106781e-01, 1.73613722e-16, 1.69292055e-16, 7.07106781e-01])
         rot_align = np.allclose(alice_quat, poses_dict['Alice'].orientation) and \
@@ -574,6 +806,223 @@ class MultiArmRRT:
         # breakpoint()
         return bad 
 
+    def is_state_valid(
+        self,
+        q: np.ndarray,
+        physics=None,
+        allow_grasp: bool = False,
+        check_grasp_ids: Optional[Dict[str, int]] = None,
+        check_relative_pose: bool = False,
+        show: bool = False,
+    ) -> bool:
+        if physics is None:
+            physics = self.physics
+        return not self.check_collision(
+            robot_qpos=q,
+            physics=physics,
+            allow_grasp=allow_grasp,
+            check_grasp_ids=check_grasp_ids,
+            check_relative_pose=check_relative_pose,
+            show=show,
+        )
+
+    def is_motion_valid(
+        self,
+        q1: np.ndarray,
+        q2: np.ndarray,
+        physics=None,
+        resolution: float = 0.006,
+        **kwargs,
+    ) -> bool:
+        for q in self.extend_ee_l2(q1, q2, resolution=resolution, physics=physics):
+            if not self.is_state_valid(q, physics=physics, **kwargs):
+                return False
+        return True
+
+    def normalize_joint_qpos(self, qpos: np.ndarray) -> np.ndarray:
+        qpos = np.asarray(qpos)
+        if len(qpos) == len(self.all_joint_idxs_in_qpos):
+            return qpos
+        return qpos[self.all_joint_idxs_in_qpos]
+
+    def parse_rrt_info(self, info: str) -> Tuple[str, float, int]:
+        try:
+            duration = float(info.split("time")[1].split("_")[0])
+            iteration = int(info.split("iter")[1].split("_")[0])
+            reason = info.split("Reason")[1].split("_")[0]
+            return reason, duration, iteration
+        except Exception:
+            logging.warning(f"Failed to parse RRT info string: {info}")
+            return "Unknown", 0.0, 0
+
+    def get_active_robot_names(
+        self,
+        start_qpos: np.ndarray,
+        goal_qpos: np.ndarray,
+        threshold: float = 1e-4,
+    ) -> List[str]:
+        active = []
+        for robot_name, joint_slice in self.robot_joint_slices.items():
+            joint_delta = np.abs(goal_qpos[joint_slice] - start_qpos[joint_slice])
+            if len(joint_delta) > 0 and np.max(joint_delta) > threshold:
+                active.append(robot_name)
+        return active
+
+    def plan_active_subset(
+        self,
+        start_qpos: np.ndarray,
+        goal_qpos: np.ndarray,
+        active_robot_names: List[str],
+        allow_grasp: bool = False,
+        check_grasp_ids: Optional[Dict[str, int]] = None,
+        skip_endpoint_collision_check: bool = False,
+        skip_direct_path: bool = False,
+        skip_smooth_path: bool = False,
+        timeout: int = 200,
+        check_relative_pose: bool = False,
+        physics=None,
+    ) -> Tuple[Optional[List[np.ndarray]], str]:
+        planning_physics = self.physics if physics is None else physics
+        start_qpos = self.normalize_joint_qpos(start_qpos)
+        goal_qpos = self.normalize_joint_qpos(goal_qpos)
+
+        active_positions = set()
+        for robot_name in active_robot_names:
+            joint_slice = self.robot_joint_slices[robot_name]
+            active_positions.update(range(joint_slice.start, joint_slice.stop))
+
+        min_values = self.joint_minmax[:, 0].copy()
+        max_values = self.joint_minmax[:, 1].copy()
+        for idx in range(len(start_qpos)):
+            if idx not in active_positions:
+                min_values[idx] = start_qpos[idx]
+                max_values[idx] = start_qpos[idx]
+
+        def collision_fn(q: np.ndarray, show: bool = False):
+            return self.check_collision(
+                robot_qpos=q,
+                physics=planning_physics,
+                allow_grasp=allow_grasp,
+                check_grasp_ids=check_grasp_ids,
+                check_relative_pose=check_relative_pose,
+                show=show,
+            )
+
+        def motion_validator(q1: np.ndarray, q2: np.ndarray):
+            return self.is_motion_valid(
+                q1,
+                q2,
+                physics=planning_physics,
+                allow_grasp=allow_grasp,
+                check_grasp_ids=check_grasp_ids,
+                check_relative_pose=check_relative_pose,
+            )
+
+        def distance_fn(q1: np.ndarray, q2: np.ndarray):
+            return self.ee_l2_distance(q1, q2, physics=planning_physics)
+
+        def extend_fn(q1: np.ndarray, q2: np.ndarray):
+            return self.extend_ee_l2(q1, q2, physics=planning_physics)
+
+        if not skip_endpoint_collision_check:
+            if collision_fn(start_qpos, show=0):
+                return None, "ReasonCollisionAtStart_time0_iter0"
+            if collision_fn(goal_qpos, show=0):
+                return None, "ReasonCollisionAtGoal_time0_iter0"
+
+        path, info = birrt(
+            start_conf=start_qpos,
+            goal_conf=goal_qpos,
+            distance_fn=distance_fn,
+            sample_fn=CenterWaypointsUniformSampler(
+                bias=0.05,
+                start_conf=start_qpos,
+                goal_conf=goal_qpos,
+                numpy_random=self.np_random,
+                min_values=min_values,
+                max_values=max_values,
+                init_samples=[],
+            ),
+            extend_fn=extend_fn,
+            collision_fn=collision_fn,
+            iterations=500,
+            smooth_iterations=80,
+            timeout=timeout,
+            greedy=True,
+            np_random=self.np_random,
+            smooth_extend_fn=extend_fn,
+            skip_direct_path=skip_direct_path,
+            skip_smooth_path=skip_smooth_path,
+            motion_validator=motion_validator,
+        )
+        if path is None:
+            return None, f"RRT failed: {info}"
+        return path, f"RRT succeeded: {info}"
+
+    def plan_prioritized(
+        self,
+        start_qpos: np.ndarray,
+        goal_qpos: np.ndarray,
+        allow_grasp: bool = False,
+        check_grasp_ids: Optional[Dict[str, int]] = None,
+        skip_endpoint_collision_check: bool = False,
+        skip_direct_path: bool = False,
+        skip_smooth_path: bool = False,
+        timeout: int = 200,
+        check_relative_pose: bool = False,
+        physics=None,
+    ) -> Tuple[Optional[List[np.ndarray]], str]:
+        planning_physics = self.physics if physics is None else physics
+        if check_relative_pose:
+            return None, "ReasonPrioritizedSkippedCoupledConstraint_time0_iter0"
+        start_qpos = self.normalize_joint_qpos(start_qpos)
+        goal_qpos = self.normalize_joint_qpos(goal_qpos)
+
+        active_robot_names = self.get_active_robot_names(start_qpos, goal_qpos)
+        if len(active_robot_names) == 0:
+            return [start_qpos], "ReasonPrioritizedNoMotion_time0_iter0"
+
+        def robot_priority(robot_name: str):
+            joint_slice = self.robot_joint_slices[robot_name]
+            delta = np.max(np.abs(goal_qpos[joint_slice] - start_qpos[joint_slice]))
+            has_object = len(check_grasp_ids.get(robot_name, [])) > 0 if check_grasp_ids else False
+            return (0 if has_object else 1, -float(delta))
+
+        ordered_robot_names = sorted(active_robot_names, key=robot_priority)
+        current = start_qpos.copy()
+        all_paths = []
+        start_time = time()
+
+        for robot_name in ordered_robot_names:
+            segment_goal = current.copy()
+            joint_slice = self.robot_joint_slices[robot_name]
+            segment_goal[joint_slice] = goal_qpos[joint_slice]
+            remaining_timeout = max(1e-6, timeout - (time() - start_time))
+            segment_path, info = self.plan_active_subset(
+                start_qpos=current,
+                goal_qpos=segment_goal,
+                active_robot_names=[robot_name],
+                allow_grasp=allow_grasp,
+                check_grasp_ids=check_grasp_ids,
+                skip_endpoint_collision_check=skip_endpoint_collision_check,
+                skip_direct_path=skip_direct_path,
+                skip_smooth_path=skip_smooth_path,
+                timeout=remaining_timeout,
+                check_relative_pose=check_relative_pose,
+                physics=planning_physics,
+            )
+            if segment_path is None:
+                duration = float(time() - start_time)
+                return None, f"ReasonPrioritizedFailed_{robot_name}_time{duration}_iter0_{info}"
+            if len(all_paths) > 0:
+                all_paths.extend(segment_path[1:])
+            else:
+                all_paths.extend(segment_path)
+            current = segment_goal
+
+        duration = float(time() - start_time)
+        return all_paths, f"ReasonPrioritizedSuccess_time{duration}_iter{len(ordered_robot_names)}"
+
 
     
     def plan(
@@ -588,25 +1037,38 @@ class MultiArmRRT:
         skip_smooth_path: bool = False,
         timeout: int = 200,
         check_relative_pose: bool = False,
+        physics=None,
     ) -> Tuple[Optional[List[np.ndarray]], str]:
 
+        planning_physics = self.physics if physics is None else physics
+        start_qpos = self.normalize_joint_qpos(start_qpos)
+        goal_qpos = self.normalize_joint_qpos(goal_qpos)
         if len(start_qpos) != len(goal_qpos):
             return None, "RRT failed: start and goal configs have different lengths."
-        if len(start_qpos) != len(self.all_joint_idxs_in_qpos):
-            start_qpos = start_qpos[self.all_joint_idxs_in_qpos]
-        if len(goal_qpos) != len(self.all_joint_idxs_in_qpos):
-            goal_qpos = goal_qpos[self.all_joint_idxs_in_qpos]
   
         def collision_fn(q: np.ndarray, show: bool = False):
             return self.check_collision(
                 robot_qpos=q,
-                physics=self.physics,
+                physics=planning_physics,
                 allow_grasp=allow_grasp,           
                 check_grasp_ids=check_grasp_ids,  
                 check_relative_pose=check_relative_pose,
                 show=show,
                 # detect_grasp=False, TODO?
             )
+        def motion_validator(q1: np.ndarray, q2: np.ndarray):
+            return self.is_motion_valid(
+                q1,
+                q2,
+                physics=planning_physics,
+                allow_grasp=allow_grasp,
+                check_grasp_ids=check_grasp_ids,
+                check_relative_pose=check_relative_pose,
+            )
+        def distance_fn(q1: np.ndarray, q2: np.ndarray):
+            return self.ee_l2_distance(q1, q2, physics=planning_physics)
+        def extend_fn(q1: np.ndarray, q2: np.ndarray):
+            return self.extend_ee_l2(q1, q2, physics=planning_physics)
         if not skip_endpoint_collision_check:
             if collision_fn(start_qpos, show=0):
                 # print("RRT failed: start qpos in collision.")
@@ -617,7 +1079,7 @@ class MultiArmRRT:
         paths, info = birrt(
                 start_conf=start_qpos,
                 goal_conf=goal_qpos,
-                distance_fn=self.ee_l2_distance,
+                distance_fn=distance_fn,
                 sample_fn=CenterWaypointsUniformSampler(
                     bias=0.05,
                     start_conf=start_qpos,
@@ -627,16 +1089,17 @@ class MultiArmRRT:
                     max_values=self.joint_minmax[:, 1],
                     init_samples=init_samples,
                 ),
-                extend_fn=self.extend_ee_l2,
+                extend_fn=extend_fn,
                 collision_fn=collision_fn,
                 iterations=800,
                 smooth_iterations=200,
                 timeout=timeout,
                 greedy=True,
                 np_random=self.np_random,
-                smooth_extend_fn=self.extend_ee_l2,
+                smooth_extend_fn=extend_fn,
                 skip_direct_path=skip_direct_path,
                 skip_smooth_path=skip_smooth_path, # enable to make sure it passes through the valid init_samples 
+                motion_validator=motion_validator,
             )
         if paths is None:
             return None, f"RRT failed: {info}"
@@ -654,49 +1117,86 @@ class MultiArmRRT:
         skip_smooth_path: bool = False,
         timeout: int = 200,
         check_relative_pose: bool = False,
+        physics=None,
     ) -> Tuple[Optional[List[np.ndarray]], str]:
        
+        planning_physics = self.physics if physics is None else physics
+        start_qpos = self.normalize_joint_qpos(start_qpos)
+        goal_qpos = self.normalize_joint_qpos(goal_qpos)
+        init_samples = [] if init_samples is None else [
+            self.normalize_joint_qpos(qpos) for qpos in init_samples
+        ]
         all_paths, all_info = [], []
         duration = 0 
         iteration = 0
-        init_samples = [] if init_samples is None else list(init_samples)
+        original_waypoint_count = len(init_samples)
+        waypoint_reason = ""
         def collision_fn(q: np.ndarray, show: bool = False):
             return self.check_collision(
                 robot_qpos=q,
-                physics=self.physics,
+                physics=planning_physics,
                 allow_grasp=allow_grasp,           
                 check_grasp_ids=check_grasp_ids,  
                 check_relative_pose=check_relative_pose,
                 show=show,
                 # detect_grasp=False, TODO?
             )
+        def motion_validator(q1: np.ndarray, q2: np.ndarray):
+            return self.is_motion_valid(
+                q1,
+                q2,
+                physics=planning_physics,
+                allow_grasp=allow_grasp,
+                check_grasp_ids=check_grasp_ids,
+                check_relative_pose=check_relative_pose,
+            )
+        def distance_fn(q1: np.ndarray, q2: np.ndarray):
+            return self.ee_l2_distance(q1, q2, physics=planning_physics)
+        def extend_fn(q1: np.ndarray, q2: np.ndarray):
+            return self.extend_ee_l2(q1, q2, physics=planning_physics)
         
         if not skip_endpoint_collision_check:
             if collision_fn(goal_qpos, show=0): 
-                print("RRT failed: goal qpos in collision.")
+                logging.info("RRT failed: goal qpos in collision.")
                 return None, "ReasonCollisionAtGoal_time0_iter0"
             
             valid_init_samples = []
+            invalid_waypoint_idxs = []
             for i, interm_goal_qpos in enumerate(init_samples):
                 if not collision_fn(interm_goal_qpos, show=0): 
                     valid_init_samples.append(interm_goal_qpos)
+                else:
+                    invalid_waypoint_idxs.append(i)
                 # return None, "RRT failed: goal qpos in collision."
                 # omit this waypoint and try planning with pruned init_sample 
-            print(f"Given waypoints: {len(init_samples)}, valid: {len(valid_init_samples)} points")
+            logging.debug(f"Given waypoints: {len(init_samples)}, valid: {len(valid_init_samples)} points")
             init_samples = valid_init_samples
+            if original_waypoint_count > 0 and len(init_samples) == 0:
+                return None, f"ReasonAllWaypointsInvalid_total{original_waypoint_count}_time0_iter0"
+            if len(invalid_waypoint_idxs) > 0:
+                waypoint_reason = (
+                    f"_PrunedInvalidWaypoints_valid{len(init_samples)}"
+                    f"_total{original_waypoint_count}"
+                )
 
         has_mandatory_waypoints = len(init_samples) > 0
         # If valid LLM/procedural waypoints exist, treat them as mandatory
         # segment goals. A global direct path can skip lift/corridor semantics.
         if not skip_direct_path and not has_mandatory_waypoints:
             start_time = time()
-            path = direct_path(start_qpos, goal_qpos, self.extend_ee_l2, collision_fn)
+            path = direct_path(
+                start_qpos,
+                goal_qpos,
+                extend_fn,
+                collision_fn,
+                motion_validator=motion_validator,
+            )
             if path is not None:
                 return path, f"ReasonDirect_time{time() - start_time}_iter1"
 
         for i, interm_goal_qpos in enumerate(init_samples[::-1] + [goal_qpos]):
             interm_start_qpos = start_qpos if i == 0 else init_samples[::-1][i-1]
-            print("planning interm_start_qpos", i)
+            logging.debug(f"planning interm_start_qpos {i}")
             if len(interm_start_qpos) != len(interm_goal_qpos):
                 return None, "RRT failed: start and goal configs have different lengths."
             if len(interm_start_qpos) != len(self.all_joint_idxs_in_qpos):
@@ -712,10 +1212,13 @@ class MultiArmRRT:
                     return None, f"ReasonCollisionAtGoal_time0_iter0"
                     
             segment_timeout = max(1e-6, timeout - duration)
+            # Keep smoothing centralized: segment-level below for mandatory
+            # waypoints, global smoothing below for ordinary split planning.
+            segment_skip_smooth = True
             paths, info = birrt(
                     start_conf=interm_start_qpos,
                     goal_conf=interm_goal_qpos,
-                    distance_fn=self.ee_l2_distance,
+                    distance_fn=distance_fn,
                     sample_fn=CenterWaypointsUniformSampler(
                         bias=0.05,
                         start_conf=interm_start_qpos,
@@ -725,23 +1228,32 @@ class MultiArmRRT:
                         max_values=self.joint_minmax[:, 1],
                         init_samples=[],
                     ),
-                    extend_fn=self.extend_ee_l2,
+                    extend_fn=extend_fn,
                     collision_fn=collision_fn,
                     iterations=800,
                     smooth_iterations=200,
                     timeout=segment_timeout,
                     greedy=True,
                     np_random=self.np_random,
-                    smooth_extend_fn=self.extend_ee_l2,
+                    smooth_extend_fn=extend_fn,
                     skip_direct_path=skip_direct_path,
-                    skip_smooth_path=skip_smooth_path, # segment-level shortcut is safe; global smoothing is handled below
+                    skip_smooth_path=segment_skip_smooth,
+                    motion_validator=motion_validator,
                 ) 
-            sub_duration = float(info.split("time")[1].split("_")[0])
-            sub_iteration = int(info.split("iter")[1].split("_")[0])
-            reason = info.split("Reason")[1].split("_")[0]
+            reason, sub_duration, sub_iteration = self.parse_rrt_info(info)
                 
             if paths is None: 
-                return None, f"Reason{reason}_time{sub_duration}_iter{sub_iteration}" 
+                return None, f"Reason{reason}_time{sub_duration}_iter{sub_iteration}{waypoint_reason}"
+            if has_mandatory_waypoints and not skip_smooth_path:
+                paths = smooth_path(
+                    path=paths,
+                    extend_fn=extend_fn,
+                    collision_fn=collision_fn,
+                    np_random=self.np_random,
+                    iterations=50,
+                    motion_validator=motion_validator,
+                )
+                info += "_segment_smoothed"
             if len(all_paths) > 0:
                 all_paths.extend(paths[1:])
             else:
@@ -751,15 +1263,16 @@ class MultiArmRRT:
             iteration += sub_iteration
         
         if skip_smooth_path or has_mandatory_waypoints:
-            return all_paths, f"ReasonSuccess_time{duration}_iter{iteration}"
+            return all_paths, f"ReasonSuccess_time{duration}_iter{iteration}{waypoint_reason}"
         
-        print('begin smoothing')
+        logging.debug('begin smoothing')
         smoothed_paths = smooth_path(
             path=all_paths,
-            extend_fn=self.extend_ee_l2,
+            extend_fn=extend_fn,
             collision_fn=collision_fn,
             np_random=self.np_random,
             iterations=50,
+            motion_validator=motion_validator,
         )
-        print('done smoothing')
-        return smoothed_paths, f"ReasonSmoothed_time{duration}_iter{iteration}"
+        logging.debug('done smoothing')
+        return smoothed_paths, f"ReasonSmoothed_time{duration}_iter{iteration}{waypoint_reason}"
