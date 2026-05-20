@@ -9,6 +9,7 @@ data/
 .env.*
 openai_key.json
 prompting/openai_client.py
+evaluator.py
 evaluate.py
 
 # Generated run artifacts.

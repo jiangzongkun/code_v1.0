@@ -1,6 +1,4 @@
 import numpy as np
-import logging
-from time import time
 from typing import Callable, List, Optional, Tuple, Union, Dict, Set
 from dm_control.utils.inverse_kinematics import qpos_from_site_pose
 from pydantic import dataclasses, validator
@@ -64,12 +62,6 @@ class PlannedPathPolicy:
         self.inhand = path_plan.get_inhand_ids(physics).copy()
         self.grasp_allowed = path_plan.get_allowed_collision_ids(physics).copy()
         self.allowed_collision_pairs = allowed_collision_pairs
-        self.ik_goal_top_k = 3
-        self.ik_per_robot_top_k = 3
-        self.enable_dry_run = False
-        self.dry_run_max_actions = 80
-        self.dry_run_forward_steps = 8
-        self.ik_failed_reason = None
         self.parse_llm_plan_to_qpos(
             physics, path_plan, update=True
             )
@@ -79,9 +71,6 @@ class PlannedPathPolicy:
         self.skip_smooth_path = skip_smooth_path # skip smoothing the path, useful for debugging
         self.plan_splitted = plan_splitted # if True, the plan is splitted into two parts, one for each robot
         self.timeout = timeout # timeout for each planning step, in number of planning steps
-
-    def is_waiting_robot(self, robot_name: str) -> bool:
-        return self.path_plan.action_strs.get(robot_name, "").strip().upper() == "WAIT"
 
     def augment_release_plan_inhand(self, physics, path_plan: LLMPathPlan):
         """Treat an actively welded object as in-hand while planning its release."""
@@ -123,33 +112,29 @@ class PlannedPathPolicy:
                 selected.append(qpos)
         return selected
 
-    def validate_sparse_path(self, path: List[np.ndarray], physics) -> bool:
+    def validate_sparse_path(self, path: List[np.ndarray]) -> bool:
         """Check shortcut segments introduced by sparsification."""
         path_ls = list(path)
         if len(path_ls) <= 1:
             return True
         for q1, q2 in zip(path_ls[:-1], path_ls[1:]):
-            if not self.rrt_planner.is_motion_valid(
-                q1,
-                q2,
-                physics=physics,
-                allow_grasp=True,
-                check_grasp_ids=self.grasp_allowed,
-                check_relative_pose=self.check_relative_pose,
-            ):
-                return False
+            for q in self.rrt_planner.extend_ee_l2(q1, q2):
+                if self.rrt_planner.check_collision(
+                    robot_qpos=q,
+                    physics=self.rrt_planner.physics,
+                    allow_grasp=True,
+                    check_grasp_ids=self.grasp_allowed,
+                    check_relative_pose=self.check_relative_pose,
+                ):
+                    return False
         return True
 
-    def sparsify_validated_path(self, path: List[np.ndarray], physics) -> Optional[List[np.ndarray]]:
+    def sparsify_validated_path(self, path: List[np.ndarray]) -> List[np.ndarray]:
         sparse_path = self.sparsify_path(path)
-        if self.validate_sparse_path(sparse_path, physics=physics):
+        if self.validate_sparse_path(sparse_path):
             return sparse_path
-        logging.warning("Sparse path validation failed; trying dense RRT path")
-        dense_path = list(path)
-        if self.validate_sparse_path(dense_path, physics=physics):
-            return dense_path
-        logging.warning("Dense RRT path also failed validation under current physics")
-        return None
+        print("Sparse path validation failed; using dense RRT path")
+        return list(path)
 
 
     def ik_ee_poses_to_qpos(self, physics, ee_poses: Dict[str, Pose]) -> Dict[str, np.ndarray]:
@@ -159,85 +144,18 @@ class PlannedPathPolicy:
         for _name in self.robot_names:
             assert _name in ee_poses.keys(), f"missing robot name {_name} in ee_poses"
         full_qpos_result = physics.data.qpos.copy()
-        qpos_target_dict = {}
-        active_ee_poses = {}
-        for _name, ee_pose in ee_poses.items():
-            robot = self.robots[_name]
-            qpos_idxs = robot.joint_idxs_in_qpos
-            if self.is_waiting_robot(_name):
-                qpos_target_dict[_name] = (physics.data.qpos[qpos_idxs].copy(), qpos_idxs)
-            else:
-                active_ee_poses[_name] = ee_pose
-
-        if len(active_ee_poses) == 0:
-            return qpos_target_dict, full_qpos_result
-
-        active_qpos_target_dict = self.rrt_planner.inverse_kinematics_all(
+        qpos_target_dict = self.rrt_planner.inverse_kinematics_all(
             physics=physics,
-            ee_poses=active_ee_poses,
+            ee_poses=ee_poses,
             allow_grasp=True, 
-            check_grasp_ids=self.grasp_allowed,
+            check_grasp_ids=self.inhand,
             check_relative_pose=self.check_relative_pose,
         ) # qpos for the robots only
-        qpos_target_dict.update(active_qpos_target_dict)
         for _name, ik_result in qpos_target_dict.items():
             if ik_result is not None:
                 robot_qpos, qpos_idxs = ik_result[0], ik_result[1] 
                 full_qpos_result[qpos_idxs] = robot_qpos
         return qpos_target_dict, full_qpos_result
-
-    def ik_ee_poses_to_qpos_candidates(
-        self,
-        physics,
-        ee_poses: Dict[str, Pose],
-    ) -> List[Tuple[Dict[str, np.ndarray], np.ndarray]]:
-        """
-        Computes several valid joint-space targets for the same EE target poses.
-        The first candidate preserves the old single-target behavior.
-        """
-        for _name in self.robot_names:
-            assert _name in ee_poses.keys(), f"missing robot name {_name} in ee_poses"
-        waiting_results = {}
-        active_ee_poses = {}
-        for _name, ee_pose in ee_poses.items():
-            robot = self.robots[_name]
-            qpos_idxs = robot.joint_idxs_in_qpos
-            if self.is_waiting_robot(_name):
-                waiting_results[_name] = (physics.data.qpos[qpos_idxs].copy(), qpos_idxs)
-            else:
-                active_ee_poses[_name] = ee_pose
-
-        if len(active_ee_poses) == 0:
-            return [(waiting_results, physics.data.qpos.copy())]
-
-        reference_qpos = physics.data.qpos[self.rrt_planner.all_joint_idxs_in_qpos]
-        candidates = self.rrt_planner.inverse_kinematics_all_candidates(
-            physics=physics,
-            ee_poses=active_ee_poses,
-            allow_grasp=True,
-            check_grasp_ids=self.grasp_allowed,
-            check_relative_pose=self.check_relative_pose,
-            num_candidates=self.ik_goal_top_k,
-            per_robot_top_k=self.ik_per_robot_top_k,
-            max_combined_candidates=self.ik_goal_top_k,
-            reference_qpos=reference_qpos,
-        )
-        if len(candidates) == 0:
-            qpos_target_dict, full_qpos_result = self.ik_ee_poses_to_qpos(physics, ee_poses)
-            if any(ik_result is None for ik_result in qpos_target_dict.values()):
-                return []
-            return [(qpos_target_dict, full_qpos_result)]
-
-        result = []
-        for qpos_target_dict, full_qpos_result, _score in candidates:
-            merged_qpos_target_dict = dict(waiting_results)
-            merged_qpos_target_dict.update(qpos_target_dict)
-            merged_full_qpos_result = full_qpos_result.copy()
-            for _name, ik_result in waiting_results.items():
-                robot_qpos, qpos_idxs = ik_result
-                merged_full_qpos_result[qpos_idxs] = robot_qpos
-            result.append((merged_qpos_target_dict, merged_full_qpos_result))
-        return result
 
     def parse_llm_plan_to_qpos(
         self, 
@@ -250,28 +168,12 @@ class PlannedPathPolicy:
         Assumes the paths for each robot are the same length, and some might end with a grasp/release.
         returns the target qpos after computing IK on all the goal/waypoint poses 
         """
-        target_candidates = self.ik_ee_poses_to_qpos_candidates(
-            physics,
-            path_plan.ee_target_poses,
-        )
-        if len(target_candidates) == 0:
-            self.ik_failed_reason = "failed to compute IK for target poses"
-            return None, [], None, []
-        qpos_target_dict, full_qpos_target = target_candidates[0]
-        failed_robots = [
-            _name for _name, ik_result in qpos_target_dict.items()
-            if ik_result is None
-        ]
-        if len(failed_robots) > 0:
-            self.ik_failed_reason = f"failed to compute IK for {', '.join(failed_robots)}"
-            return None, [], None, []
-        self.ik_failed_reason = None
+        qpos_target_dict, full_qpos_target = self.ik_ee_poses_to_qpos(
+            physics, path_plan.ee_target_poses
+        ) 
+        for _name, ik_result in qpos_target_dict.items():
+            assert ik_result is not None, f"failed to compute IK for {_name}" 
         joint_qpos_target = full_qpos_target[self.rrt_planner.all_joint_idxs_in_qpos]
-        full_qpos_target_candidates = [full_qpos for _, full_qpos in target_candidates]
-        joints_qpos_target_candidates = [
-            full_qpos[self.rrt_planner.all_joint_idxs_in_qpos]
-            for full_qpos in full_qpos_target_candidates
-        ]
  
         # target_qpos are NOT allowed to be IK-insolvable, but waypoints might be
         ee_waypoints_list = path_plan.ee_waypoints_list 
@@ -283,17 +185,15 @@ class PlannedPathPolicy:
 
             if all([ik_result is not None for ik_result in attempt_qpos_dict.values()]): 
                 waypoints_full_qpos.append(attempt_full_qpos)
-        logging.debug(f"Given {len(ee_waypoints_list)} waypoints, found {len(waypoints_full_qpos)} valid waypoints via IK")
+        print(f"Given {len(ee_waypoints_list)} waypoints, found {len(waypoints_full_qpos)} valid waypoints via IK")
         joints_qpos_waypoints = [
             qpos[self.rrt_planner.all_joint_idxs_in_qpos] for qpos in waypoints_full_qpos
             ]
         if verbose:
-            logging.debug(f"found {len(waypoints_full_qpos)} valid waypoints via IK")
+            print(f"found {len(waypoints_full_qpos)} valid waypoints via IK")
         if update:
             self.full_qpos_target = full_qpos_target
             self.joints_qpos_target = joint_qpos_target
-            self.full_qpos_target_candidates = full_qpos_target_candidates
-            self.joints_qpos_target_candidates = joints_qpos_target_candidates
             self.waypoints_full_qpos = waypoints_full_qpos
             self.joints_qpos_waypoints = joints_qpos_waypoints
         return full_qpos_target, waypoints_full_qpos, joint_qpos_target, joints_qpos_waypoints
@@ -319,7 +219,8 @@ class PlannedPathPolicy:
                         body_name = 'CB24'
 
                     else:
-                        raise ValueError(f"Unexpected rope object name: {obj_name}")
+                        print(obj_name)
+                        breakpoint()
                     
                     weld_id = physics.named.model.eq_active._convert_key(weld_name)
                     tograsp[robot_name] = dict(
@@ -353,245 +254,13 @@ class PlannedPathPolicy:
                         tograsp[robot_name]["weld_id"] = weld_id # change to weld id!
                         tograsp[robot_name]["weld_name"] = weld_name
                     except KeyError:
-                        raise ValueError(f"{weld_name} not found in eq_active")
+                        print(f"{weld_name} not found in eq_active")
+                        breakpoint()
+                        continue
                     
         return tograsp 
 
-    def get_goal_candidates(self) -> List[Tuple[np.ndarray, np.ndarray]]:
-        full_goal_candidates = getattr(
-            self,
-            "full_qpos_target_candidates",
-            [self.full_qpos_target],
-        )
-        joint_goal_candidates = getattr(
-            self,
-            "joints_qpos_target_candidates",
-            [self.joints_qpos_target],
-        )
-        seen = []
-        goal_candidates = []
-        for full_goal, joint_goal in zip(full_goal_candidates, joint_goal_candidates):
-            if any(np.allclose(joint_goal, prev, atol=1e-4) for prev in seen):
-                continue
-            seen.append(joint_goal)
-            goal_candidates.append((full_goal, joint_goal))
-        if len(goal_candidates) == 0:
-            goal_candidates = [(self.full_qpos_target, self.joints_qpos_target)]
-        return goal_candidates
-
-    def has_rope_interaction(self) -> bool:
-        for info_dict in [self.path_plan.tograsp, self.path_plan.inhand]:
-            for info in info_dict.values():
-                if info is not None and ("rope" in str(info[0]).lower() or "cb" in str(info[0]).lower()):
-                    return True
-        action_text = " ".join(self.path_plan.action_strs.values()).lower()
-        return "rope" in action_text
-
-    def is_pick_place_like(self) -> bool:
-        if self.has_rope_interaction():
-            return False
-        has_grasp_change = any(info is not None for info in self.tograsp.values())
-        has_inhand = any(len(ids) > 0 for ids in self.inhand.values())
-        action_text = " ".join(self.path_plan.action_strs.values()).lower()
-        keywords = ("pick", "place", "put", "grasp", "release", "drop")
-        return has_grasp_change or has_inhand or any(keyword in action_text for keyword in keywords)
-
-    def moving_robot_names(
-        self,
-        start_qpos: np.ndarray,
-        goal_qpos: np.ndarray,
-        threshold: float = 1e-4,
-    ) -> List[str]:
-        active = []
-        for robot_name, joint_slice in self.rrt_planner.robot_joint_slices.items():
-            joint_delta = np.abs(goal_qpos[joint_slice] - start_qpos[joint_slice])
-            if len(joint_delta) > 0 and np.max(joint_delta) > threshold:
-                active.append(robot_name)
-        return active
-
-    def strip_duplicate_path(self, path: List[np.ndarray]) -> List[np.ndarray]:
-        result = []
-        for qpos in path:
-            if len(result) == 0 or not np.allclose(result[-1], qpos, atol=1e-5):
-                result.append(qpos)
-        return result
-
-    def try_direct_path(
-        self,
-        start_qpos: np.ndarray,
-        goal_qpos: np.ndarray,
-        physics,
-    ) -> Tuple[Optional[List[np.ndarray]], str]:
-        if self.skip_direct_path or len(self.joints_qpos_waypoints) > 0:
-            return None, "ReasonDirectSkipped_time0_iter0"
-        if not self.rrt_planner.is_state_valid(
-            start_qpos,
-            physics=physics,
-            allow_grasp=True,
-            check_grasp_ids=self.grasp_allowed,
-            check_relative_pose=self.check_relative_pose,
-        ):
-            return None, "ReasonCollisionAtStart_time0_iter0"
-        if not self.rrt_planner.is_state_valid(
-            goal_qpos,
-            physics=physics,
-            allow_grasp=True,
-            check_grasp_ids=self.grasp_allowed,
-            check_relative_pose=self.check_relative_pose,
-        ):
-            return None, "ReasonCollisionAtGoal_time0_iter0"
-        if not self.rrt_planner.is_motion_valid(
-            start_qpos,
-            goal_qpos,
-            physics=physics,
-            allow_grasp=True,
-            check_grasp_ids=self.grasp_allowed,
-            check_relative_pose=self.check_relative_pose,
-        ):
-            return None, "ReasonDirectMotionInvalid_time0_iter0"
-        path = [start_qpos] + self.rrt_planner.extend_ee_l2(
-            start_qpos,
-            goal_qpos,
-            physics=physics,
-        )
-        return path, "ReasonDirectSelector_time0_iter1"
-
-    def try_pick_place_template(
-        self,
-        start_qpos: np.ndarray,
-        goal_qpos: np.ndarray,
-        physics,
-        lift_height: float = 0.08,
-    ) -> Tuple[Optional[List[np.ndarray]], str]:
-        if len(self.joints_qpos_waypoints) > 0 or self.check_relative_pose:
-            return None, "ReasonTemplateSkippedWaypointsOrConstraint_time0_iter0"
-        if not self.is_pick_place_like():
-            return None, "ReasonTemplateSkippedAction_time0_iter0"
-
-        moving = set(self.moving_robot_names(start_qpos, goal_qpos))
-        if len(moving) == 0:
-            return None, "ReasonTemplateSkippedNoMotion_time0_iter0"
-
-        current_poses = self.rrt_planner.forward_kinematics_all(
-            q=start_qpos,
-            physics=physics,
-            return_ee_pose=True,
-        )
-        if current_poses is None:
-            return None, "ReasonTemplateNoCurrentPose_time0_iter0"
-
-        lift_current_poses = {}
-        lift_target_poses = {}
-        for robot_name in self.robot_names:
-            current_pose = current_poses[robot_name]
-            target_pose = self.path_plan.ee_target_poses[robot_name]
-            if robot_name in moving:
-                current_pos = current_pose.position.copy()
-                current_pos[2] += lift_height
-                target_pos = target_pose.position.copy()
-                target_pos[2] += lift_height
-                lift_current_poses[robot_name] = Pose(
-                    position=current_pos,
-                    orientation=current_pose.orientation.copy(),
-                )
-                lift_target_poses[robot_name] = Pose(
-                    position=target_pos,
-                    orientation=target_pose.orientation.copy(),
-                )
-            else:
-                lift_current_poses[robot_name] = Pose(
-                    position=current_pose.position.copy(),
-                    orientation=current_pose.orientation.copy(),
-                )
-                lift_target_poses[robot_name] = Pose(
-                    position=current_pose.position.copy(),
-                    orientation=current_pose.orientation.copy(),
-                )
-
-        lift_current_dict, lift_current_full = self.ik_ee_poses_to_qpos(
-            physics,
-            lift_current_poses,
-        )
-        if any(ik_result is None for ik_result in lift_current_dict.values()):
-            return None, "ReasonTemplateCurrentLiftIKFailed_time0_iter0"
-
-        lift_target_dict, lift_target_full = self.ik_ee_poses_to_qpos(
-            physics,
-            lift_target_poses,
-        )
-        if any(ik_result is None for ik_result in lift_target_dict.values()):
-            return None, "ReasonTemplateTargetLiftIKFailed_time0_iter0"
-
-        path = self.strip_duplicate_path([
-            start_qpos,
-            lift_current_full[self.rrt_planner.all_joint_idxs_in_qpos],
-            lift_target_full[self.rrt_planner.all_joint_idxs_in_qpos],
-            goal_qpos,
-        ])
-        if len(path) <= 1:
-            return None, "ReasonTemplateSkippedNoMotion_time0_iter0"
-        if not self.validate_sparse_path(path, physics=physics):
-            return None, "ReasonTemplateMotionInvalid_time0_iter0"
-        return path, "ReasonPickPlaceTemplate_time0_iter3"
-
-    def is_low_coupling_plan(self, start_qpos: np.ndarray, goal_qpos: np.ndarray) -> bool:
-        if len(self.joints_qpos_waypoints) > 0 or self.check_relative_pose or self.has_rope_interaction():
-            return False
-        return len(self.moving_robot_names(start_qpos, goal_qpos)) == 1
-
-    def try_prioritized_plan(
-        self,
-        start_qpos: np.ndarray,
-        goal_qpos: np.ndarray,
-        physics,
-        timeout: float,
-    ) -> Tuple[Optional[List[np.ndarray]], str]:
-        if not self.is_low_coupling_plan(start_qpos, goal_qpos):
-            return None, "ReasonPrioritizedSkippedCoupled_time0_iter0"
-        return self.rrt_planner.plan_prioritized(
-            start_qpos=start_qpos,
-            goal_qpos=goal_qpos,
-            skip_endpoint_collision_check=0,
-            allow_grasp=True,
-            check_grasp_ids=self.grasp_allowed,
-            skip_direct_path=self.skip_direct_path,
-            skip_smooth_path=self.skip_smooth_path,
-            check_relative_pose=self.check_relative_pose,
-            timeout=timeout,
-            physics=physics,
-        )
-
-    def run_dry_run(
-        self,
-        physics,
-        actions: List[SimAction],
-    ) -> bool:
-        if not self.enable_dry_run:
-            return True
-        physics_cp = physics.copy(share_model=False)
-        for action_idx, action in enumerate(actions[: self.dry_run_max_actions]):
-            if len(action.ctrl_idxs) == 0:
-                continue
-            for _ in range(self.dry_run_forward_steps):
-                physics_cp.data.ctrl[action.ctrl_idxs] = action.ctrl_vals
-                if action.eq_active_idxs is not None and len(action.eq_active_idxs) > 0:
-                    physics_cp.model.eq_active[action.eq_active_idxs] = action.eq_active_vals
-                physics_cp.step()
-                robot_qpos = physics_cp.data.qpos[self.rrt_planner.all_joint_idxs_in_qpos]
-                if self.rrt_planner.check_collision(
-                    robot_qpos=robot_qpos,
-                    physics=physics_cp,
-                    allow_grasp=True,
-                    check_grasp_ids=self.grasp_allowed,
-                    check_relative_pose=self.check_relative_pose,
-                ):
-                    logging.warning(f"Dry-run collision at action {action_idx}")
-                    return False
-        return True
-
     def plan_qpos(self, physics):
-        if self.ik_failed_reason is not None:
-            return None, self.ik_failed_reason
         start_qpos = physics.data.qpos.copy()
         joints_start_qpos = start_qpos[self.rrt_planner.all_joint_idxs_in_qpos] 
         
@@ -619,104 +288,42 @@ class PlannedPathPolicy:
         #     # print(physics_cp.model.contacts)
         # breakpoint()
 
-        plan_fn = self.rrt_planner.plan_splitted if self.plan_splitted else self.rrt_planner.plan
-        goal_candidates = self.get_goal_candidates()
-        start_time = time()
-        last_path = (None, "ReasonNoIKGoalCandidate_time0_iter0")
-        _, last_joint_goal = goal_candidates[0]
-        for candidate_idx, (full_goal, joint_goal) in enumerate(goal_candidates):
-            path, reason = self.try_direct_path(
-                joints_start_qpos,
-                joint_goal,
-                physics,
-            )
-            if path is not None:
-                path_ls = self.sparsify_validated_path(path, physics=physics)
-                if path_ls is not None:
-                    self.full_qpos_target = full_goal
-                    self.joints_qpos_target = joint_goal
-                    return path_ls, f"{reason}_PlannerDirect_IKCandidate{candidate_idx}"
-                last_path = (None, f"{reason}_ValidationFailed")
-            else:
-                last_path = (None, reason)
-
-            path, reason = self.try_pick_place_template(
-                joints_start_qpos,
-                joint_goal,
-                physics,
-            )
-            if path is not None:
-                path_ls = self.sparsify_validated_path(path, physics=physics)
-                if path_ls is not None:
-                    self.full_qpos_target = full_goal
-                    self.joints_qpos_target = joint_goal
-                    return path_ls, f"{reason}_PlannerTemplate_IKCandidate{candidate_idx}"
-                last_path = (None, f"{reason}_ValidationFailed")
-            else:
-                last_path = (None, reason)
-
-            remaining_timeout = max(1e-6, self.timeout - (time() - start_time))
-            prioritized_timeout = min(remaining_timeout, max(1e-6, self.timeout * 0.35))
-            path, reason = self.try_prioritized_plan(
-                joints_start_qpos,
-                joint_goal,
-                physics,
-                timeout=prioritized_timeout,
-            )
-            if path is not None:
-                path_ls = self.sparsify_validated_path(path, physics=physics)
-                if path_ls is not None:
-                    self.full_qpos_target = full_goal
-                    self.joints_qpos_target = joint_goal
-                    return path_ls, f"{reason}_PlannerPrioritized_IKCandidate{candidate_idx}"
-                last_path = (None, f"{reason}_ValidationFailed")
-            else:
-                last_path = (None, reason)
-
-            remaining_timeout = max(1e-6, self.timeout - (time() - start_time))
-            rrt_path = plan_fn(
-                start_qpos=joints_start_qpos,
-                goal_qpos=joint_goal,
-                skip_endpoint_collision_check=0,
-                init_samples=self.joints_qpos_waypoints[::-1], # NOTE: reverse waypoints
-                allow_grasp=True,
-                check_grasp_ids=self.grasp_allowed,
-                skip_direct_path=self.skip_direct_path,
-                skip_smooth_path=self.skip_smooth_path,
-                check_relative_pose=self.check_relative_pose,
-                timeout=remaining_timeout,
-                physics=physics,
-            )
-            if rrt_path[0] is not None:
-                path_ls = self.sparsify_validated_path(rrt_path[0], physics=physics)
-                if path_ls is not None:
-                    self.full_qpos_target = full_goal
-                    self.joints_qpos_target = joint_goal
-                    reason = f"{rrt_path[1]}_PlannerRRT_IKCandidate{candidate_idx}"
-                    return path_ls, reason
-                last_path = (None, f"{rrt_path[1]}_ValidationFailed")
-            else:
-                last_path = rrt_path
-            last_joint_goal = joint_goal
-
-        logging.warning(f"failed to find a path, reason: {last_path[1]}")
-        physics_cp = physics.copy(share_model=True)
-        physics_cp.data.qpos[self.rrt_planner.all_joint_idxs_in_qpos] = last_joint_goal
-        qpos_str = " ".join(physics_cp.data.qpos.astype(str))
-        logging.warning(f"<key name='rrt_fail' qpos='{qpos_str}'/>")
-        # physics_cp.forward()
-        # img_arr = physics_cp.render(
-        # camera_id='teaser', height=400, width=400,
-        # )
-        # physics_cp.data.qpos[:] = start_qpos
-        # physics_cp.forward()
-        # img_arr = np.concatenate([img_arr, physics_cp.render(
-        #     camera_id='teaser', height=400, width=600,
-        #     )], axis=1)
-        # plt.imshow(img_arr)
-        # plt.show()
-        # breakpoint()
-        return None, last_path[1]
+        plan_fn = self.rrt_planner.plan 
+        if self.plan_splitted:
+            plan_fn = self.rrt_planner.plan_splitted
+        path = plan_fn(
+            start_qpos=joints_start_qpos,
+            goal_qpos=self.joints_qpos_target,
+            skip_endpoint_collision_check=0,
+            init_samples=self.joints_qpos_waypoints[::-1], # NOTE: reverse waypoints
+            allow_grasp=True, 
+            check_grasp_ids=self.grasp_allowed,
+            skip_direct_path=self.skip_direct_path,
+            skip_smooth_path=self.skip_smooth_path,
+            check_relative_pose=self.check_relative_pose,
+            timeout=self.timeout,
+        )
+        if path[0] is None:
+            print(f"failed to find a path, reason: {path[1]}")
+            physics_cp = physics.copy(share_model=True)
+            physics_cp.data.qpos[self.rrt_planner.all_joint_idxs_in_qpos]  = self.joints_qpos_target
+            qpos_str = " ".join(physics_cp.data.qpos.astype(str))
+            print(f"<key name='rrt_fail' qpos='{qpos_str}'/>")
+            # physics_cp.forward()
+            # img_arr = physics_cp.render(
+            # camera_id='teaser', height=400, width=400,
+            # )
+            # physics_cp.data.qpos[:] = start_qpos
+            # physics_cp.forward()
+            # img_arr = np.concatenate([img_arr, physics_cp.render(
+            #     camera_id='teaser', height=400, width=600,
+            #     )], axis=1)
+            # plt.imshow(img_arr)
+            # plt.show()
+            # breakpoint()
+            return None, path[1]
+        path_ls = self.sparsify_validated_path(path[0])
+        return path_ls, path[1]
     
     def map_qpos_to_ctrl(self, physics, qpos: np.ndarray, include_inhand: bool = True) -> Dict[str, np.ndarray]:
         ctrl_idxs = []
@@ -792,7 +399,7 @@ class PlannedPathPolicy:
                     robot_ee_pos = pose.position 
                     dist = np.linalg.norm(site_xpos - robot_ee_pos)
                     if dist > 0.1:
-                        logging.warning(f"robot {robot_name} end effector distance: {dist} is too far from object {obj_info['obj_name']}")
+                        print(f"WARNING: robot {robot_name} end effector distance: {dist} is too far from object {obj_info['obj_name']}")   
             
                 grasp_idxs.append(
                     self.robots[robot_name].grasp_idx
@@ -853,22 +460,18 @@ class PlannedPathPolicy:
             skip_direct_path=self.skip_direct_path,
             skip_smooth_path=self.skip_smooth_path,
             check_relative_pose=self.check_relative_pose,
-            physics=physics,
         )
         if path[0] is None:
-            logging.warning(f"Failed to find a path to return to Home, reason: {path[1]}")
+            print(f"Failed to find a path to return to Home, reason: {path[1]}")
             physics_cp = physics.copy(share_model=True)
             physics_cp.data.qpos[self.rrt_planner.all_joint_idxs_in_qpos]  = goal_qpos
             qpos_str = " ".join(physics_cp.data.qpos.astype(str))
-            logging.warning(f"<key name='rrt_return_home_fail' qpos='{qpos_str}'/>")
+            print(f"<key name='rrt_return_home_fail' qpos='{qpos_str}'/>")
             # breakpoint()
             return []
         else:
-            logging.debug("Found a path to return to Home")
-            path_ls = self.sparsify_validated_path(path[0], physics=physics)
-            if path_ls is None:
-                logging.warning("Return-home path failed validation under current physics")
-                return []
+            print(f"Found a path to return to Home")
+            path_ls = self.sparsify_validated_path(path[0])
             actions = []
             for qpos in path_ls:
                 kwargs = self.map_qpos_to_ctrl(physics, qpos, include_inhand=False) # avoid gripper keep grasping after placing
@@ -896,8 +499,6 @@ class PlannedPathPolicy:
         actions.extend(
             self.plan_home(physics, end_qpos)
         )  
-        if not self.run_dry_run(physics, actions):
-            return False, f"{reason}_DryRunFailed"
         self.action_buffer = actions  
         self.action_idx = 0
         return True, reason
@@ -914,7 +515,7 @@ class PlannedPathPolicy:
         if self.close_loop:
             replanned, reason = self.plan(physics)
             if not replanned:
-                logging.warning("replanning failed, using previous plan")
+                print("replanning failed, using previous plan")
         else:
             assert len(self.action_buffer) != 0, "action buffer is empty, cal plan_qpos first"
         action = self.action_buffer[self.action_idx]

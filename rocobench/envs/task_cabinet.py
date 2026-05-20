@@ -193,7 +193,7 @@ class CabinetTask(MujocoSimEnv):
             Bob=graspables,
             Chad=graspables,
         )
-
+    
     def get_robot_name(self, agent_name):
         return self.robot_name_map_inv[agent_name]
     
@@ -439,61 +439,16 @@ End your response by either: 1) output PROCEED, if the plans require further dis
                 
     def get_task_feedback(self, llm_plan, pose_dict):
         feedback = ""
-        left_slice = self.physics.named.data.qpos._convert_key("leftdoorhinge")
-        right_slice = self.physics.named.data.qpos._convert_key("rightdoorhinge")
-        left_qpos = self.physics.data.qpos[left_slice.start]
-        right_qpos = self.physics.data.qpos[right_slice.start]
-        left_door_open = left_qpos < -2
-        right_door_open = right_qpos > 2
-
-        obs = self.get_obs()
-        all_robot_contacts = []
-        for robot_name in self.robot_name_map_inv.values():
-            robot_state = getattr(obs, robot_name, None)
-            if robot_state is not None:
-                all_robot_contacts.extend(robot_state.contacts)
-
-        if self.cabinet_pos[0] < 0:
-            priority_handle = "right_door_handle"
-            priority_open = right_door_open
-        else:
-            priority_handle = "left_door_handle"
-            priority_open = left_door_open
-        priority_held = priority_handle in all_robot_contacts
-        priority_in_plan = any(
-            f"PICK {priority_handle}" in action_str
-            for action_str in llm_plan.action_strs.values()
-        )
-        other_door_in_plan = any(
-            "door_handle" in action_str
-            and priority_handle not in action_str
-            and "WAIT" not in action_str
-            for action_str in llm_plan.action_strs.values()
-        )
-        if not priority_open and not priority_held and not priority_in_plan and other_door_in_plan:
-            feedback += (
-                f"{priority_handle} must be picked before advancing the other door alone; "
-                f"pick it first or together with the other handle."
-            )
-
         for agent_name, action_str in llm_plan.action_strs.items():
             if 'PICK mug' in action_str or 'PICK cup' in action_str:
                 if 'PLACE' not in action_str:
                     feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE"
             if self.cabinet_pos[0] < 0:
-                invalid_door = (
-                    (agent_name == "Alice" and "right_door_handle" in action_str)
-                    or (agent_name == "Bob" and "left_door_handle" in action_str)
-                    or (agent_name == "Chad" and "left_door_handle" in action_str)
-                )
+                if 'door_handle' in action_str and agent_name == "Chad":
+                    feedback += f"{agent_name} cannot reach door"
             else:
-                invalid_door = (
-                    (agent_name == "Alice" and "left_door_handle" in action_str)
-                    or (agent_name == "Bob" and "right_door_handle" in action_str)
-                    or (agent_name == "Chad" and "right_door_handle" in action_str)
-                )
-            if invalid_door:
-                feedback += f"{agent_name} cannot reach that door handle"
+                if 'door_handle' in action_str and agent_name == "Bob":
+                    feedback += f"{agent_name} cannot reach door"
         if all(['WAIT' in action_str for action_str in llm_plan.action_strs.values()]):
             feedback += "At least one robot should be acting, you can't all WAIT."
         return feedback 
@@ -575,3 +530,4 @@ if __name__ == "__main__":
     obs = env.reset()
     print(env.describe_obs(obs))
     print(env.get_agent_prompt(obs, "Alice"))
+    

@@ -1,6 +1,5 @@
 import json
 import os
-from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 try:
@@ -72,12 +71,6 @@ except ModuleNotFoundError as exc:
             _client_config = config
         return _client
 
-    def _is_ollama_base_url() -> bool:
-        base_url = resolve_base_url()
-        parsed = urlparse(base_url)
-        host = parsed.hostname or ""
-        return host in {"localhost", "127.0.0.1"} and parsed.port == 11434
-
     def _extra_body_for_model(model: str) -> Optional[Dict[str, Any]]:
         extra_body = os.environ.get("OPENAI_EXTRA_BODY")
         if extra_body:
@@ -88,12 +81,6 @@ except ModuleNotFoundError as exc:
         if enable_thinking is not None:
             disable_thinking = "0" if enable_thinking not in FALSE_VALUES else "1"
         if disable_thinking not in FALSE_VALUES and "qwen" in model.lower():
-            if _is_ollama_base_url():
-                effort = os.environ.get(
-                    "OLLAMA_REASONING_EFFORT",
-                    os.environ.get("OPENAI_REASONING_EFFORT", "none"),
-                )
-                return {"reasoning_effort": effort, "reasoning": {"effort": effort}}
             return {"chat_template_kwargs": {"enable_thinking": False}}
         return None
 
@@ -118,23 +105,7 @@ except ModuleNotFoundError as exc:
     def response_content(response: Any) -> Optional[str]:
         if not response.choices:
             return None
-        message = response.choices[0].message
-        content = getattr(message, "content", None)
-        if content:
-            return content
-
-        if hasattr(message, "model_dump"):
-            message_dict = message.model_dump()
-        elif isinstance(message, dict):
-            message_dict = message
-        else:
-            message_dict = {}
-
-        for key in ("reasoning_content", "reasoning", "thinking"):
-            value = message_dict.get(key)
-            if isinstance(value, str) and "EXECUTE" in value:
-                return value
-        return content
+        return response.choices[0].message.content
 
     def response_usage(response: Any) -> Dict[str, Any]:
         usage = getattr(response, "usage", None)

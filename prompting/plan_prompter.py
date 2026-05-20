@@ -93,32 +93,19 @@ DEFAULT_USER_PROMPT = "Generate the next robot plan. Output the required EXECUTE
 def get_chat_prompt(env: MujocoSimEnv):
     if env.__class__.__name__ == "CabinetTask":
         return """
-Plan the next Cabinet action from the current [Scene description] and [Environment Feedback]. Output only the EXECUTE block. Do not show reasoning.
-
-Use this state policy:
-1) Choose roles from the current handle/object positions, not from a fixed seed.
-   - If the cabinet/handles are on the table-left side, Alice handles left_door_handle, Bob handles right_door_handle, and Chad handles mug/cup.
-   - If the cabinet/handles are on the table-right side, Chad handles left_door_handle, Alice handles right_door_handle, and Bob handles mug/cup.
-   - For a table-left cabinet, secure right_door_handle before advancing left_door_handle alone; for a table-right cabinet, secure left_door_handle before advancing right_door_handle alone.
-2) For each door:
-   - If the door is closed and its door robot is not holding the handle, that robot must PICK that handle.
-   - If the door is closed and its door robot is already holding the handle, that robot must OPEN that handle.
-   - If the door is open, that door robot should WAIT to keep it open.
-3) Only after both doors are open, move cabinet objects:
-   - If mug is not on mug_coaster, the item robot must output PICK mug PLACE mug_coaster.
-   - Else if cup is not on cup_coaster, the item robot must output PICK cup PLACE cup_coaster.
-   - PICK and PLACE must be in the same single action for mug/cup.
-4) Never output all WAIT while mug or cup is not on its coaster. Never PICK mug/cup before both doors are open.
-5) If feedback says IK failed for one robot in a simultaneous door plan, split the door work: keep the other robots WAIT and retry only the still-needed PICK/OPEN action. Do not repeat the same combined failing plan.
-   - If the IK failure is on the priority handle above, retry that priority-handle action alone before moving the other door.
-6) If feedback says IK failed for PICK mug PLACE mug_coaster, try PICK cup PLACE cup_coaster next if cup is still unfinished. If cup fails similarly and mug is unfinished, switch back to mug. Do not repeat the exact same failed object action more than twice.
-7) If previous feedback says all robots WAITed, fix it by assigning the unfinished mug/cup action to the item robot. If feedback says format/parsing failed, output only valid NAME lines.
-
+Output only the next executable Cabinet plan. Do not show reasoning.
+Use the current scene state:
+- Closed door with gripper not holding handle: PICK that door handle.
+- Closed door with gripper holding handle: OPEN that door handle.
+- Open door: the door robot WAITs to hold it open.
+- Once both doors are open, the item robot must PICK the first object not on its coaster and PLACE it on the matching coaster.
+- If mug is on its coaster and cup is not, the next acting item must be PICK cup PLACE cup_coaster.
+- Never output all WAIT while either mug or cup is not on its coaster.
 Output only:
 EXECUTE
-NAME Alice ACTION <PICK handle | OPEN handle | PICK mug PLACE mug_coaster | PICK cup PLACE cup_coaster | WAIT>
-NAME Bob ACTION <PICK handle | OPEN handle | PICK mug PLACE mug_coaster | PICK cup PLACE cup_coaster | WAIT>
-NAME Chad ACTION <PICK handle | OPEN handle | PICK mug PLACE mug_coaster | PICK cup PLACE cup_coaster | WAIT>
+NAME <robot> ACTION <action>
+NAME <robot> ACTION <action>
+NAME <robot> ACTION <action>
         """
     robot_names = env.get_sim_robots().keys()
     talk_order_str = ",".join([f"[{name}]" for name in robot_names])
@@ -213,26 +200,14 @@ NAME Bob ACTION <PICK item PATH <4 coords> | PLACE item slot PATH <4 coords> | W
         """
     if env.__class__.__name__ == "CabinetTask":
         return """
-Coordinate the 3 robots to take mug and cup from the cabinet and place them on the correct coasters. Output only the EXECUTE block. Do not show reasoning.
-
-Use this Cabinet state policy:
-1) Choose roles from the current handle/object positions, not from a fixed seed.
-   - Table-left cabinet: Alice handles left_door_handle, Bob handles right_door_handle, Chad handles mug/cup.
-   - Table-right cabinet: Chad handles left_door_handle, Alice handles right_door_handle, Bob handles mug/cup.
-   - Table-left cabinet: right_door_handle must be secured before left_door_handle advances alone. Table-right cabinet: left_door_handle must be secured before right_door_handle advances alone.
-2) Open-door phase:
-   - Closed door + robot not holding its handle -> PICK that handle.
-   - Closed door + robot already holding its handle -> OPEN that handle.
-   - Open door -> that door robot WAITs to hold it open.
-3) Item phase starts only after BOTH doors are open:
-   - If mug is not on mug_coaster, item robot outputs PICK mug PLACE mug_coaster.
-   - Else if cup is not on cup_coaster, item robot outputs PICK cup PLACE cup_coaster.
-   - For mug/cup, PICK and PLACE are one single ACTION and must always appear together.
-4) Never PICK mug/cup before both doors are open. Never output all WAIT while either mug or cup is not on its coaster. If feedback reports all WAIT or a failed format, correct that specific issue in the next EXECUTE block.
-5) If feedback reports IK failure for one robot during simultaneous door work, split the door work into a single active door action and WAIT for the others. Do not repeat the same combined failing plan.
-   If the failed action is the priority handle above, retry that priority-handle PICK alone first.
-6) If feedback reports IK failure for PICK mug PLACE mug_coaster, try PICK cup PLACE cup_coaster if cup is not done; if cup fails and mug is not done, switch back. Avoid repeating the exact same failed object action more than twice.
-
+Coordinate 3 robots to take mug and cup from cabinet and place on correct coasters. Do not show reasoning.
+Use the reachability stated by the current scene and agent capabilities; do not assume a fixed cabinet side.
+Phase 1 - Open both doors:
+  Door handlers PICK their reachable handle, then OPEN it, then WAIT to hold it open.
+Phase 2 - After BOTH doors are open, the free item robot picks and places items:
+  PICK mug PLACE mug_coaster first if mug is not on its coaster; otherwise PICK cup PLACE cup_coaster.
+  PICK+PLACE is one single ACTION - always output both together for mug/cup.
+Rules: Never PICK mug/cup until BOTH doors are open. Never have all 3 robots WAIT while either object is not on its coaster.
 Output only:
 EXECUTE
 NAME Alice ACTION <PICK handle | OPEN handle | PICK mug PLACE mug_coaster | PICK cup PLACE cup_coaster | WAIT>
@@ -286,6 +261,8 @@ class SingleThreadPrompter:
         self.max_tokens = max_tokens
         if pack_fallback_first is not None:
             fallback_first = pack_fallback_first
+        if env.__class__.__name__ == "CabinetTask" and not debug_mode:
+            fallback_first = True
         self.fallback_first = fallback_first
 
         self.round_history = [] # [obs_t, action_t] but only if action_t got executed
@@ -1328,8 +1305,6 @@ class SingleThreadPrompter:
     def build_fallback_candidates(self, obs: EnvState) -> List[str]:
         if self.env.__class__.__name__ == "MoveRopeTask":
             return self.build_rope_fallback_candidates(obs)
-        if self.env.__class__.__name__ == "CabinetTask":
-            return self.build_cabinet_fallback_candidates(obs)
         if self.env.__class__.__name__ == "PackGroceryTask":
             return self.build_pack_fallback_candidates(obs)
         response = self.build_fallback_response(obs)
@@ -1353,14 +1328,6 @@ class SingleThreadPrompter:
             if ready_to_execute:
                 return True, candidate, llm_plans, last_feedback
         return False, (candidates[-1] if candidates else None), None, last_feedback
-
-    def _format_cabinet_response(self, actions: Dict[str, str]) -> str:
-        return (
-            f"EXECUTE\n"
-            f"NAME Alice ACTION {actions['Alice']}\n"
-            f"NAME Bob ACTION {actions['Bob']}\n"
-            f"NAME Chad ACTION {actions['Chad']}"
-        )
 
     def build_cabinet_fallback_response(self, obs: EnvState) -> Optional[str]:
         """Deterministic fallback for CabinetTask."""
@@ -1424,39 +1391,12 @@ class SingleThreadPrompter:
             elif not cup_on_coaster:
                 actions[item_agent] = "PICK cup PLACE cup_coaster"
 
-        return self._format_cabinet_response(actions)
-
-    def build_cabinet_fallback_candidates(self, obs: EnvState) -> List[str]:
-        """Generate Cabinet fallback candidates after LLM replans fail.
-
-        The compact state-machine action is tried first. If lightweight
-        validation rejects a simultaneous door plan, single-active-door
-        candidates let the task still make monotonic progress.
-        """
-        base = self.build_cabinet_fallback_response(obs)
-        if base is None:
-            return []
-
-        candidates = [base]
-        parse_succ, _, llm_plans = self.parser.parse(obs, base)
-        if not parse_succ or len(llm_plans) == 0:
-            return candidates
-
-        action_strs = llm_plans[0].action_strs
-        active_door_actions = [
-            (agent_name, action)
-            for agent_name, action in action_strs.items()
-            if action != "WAIT" and ("door_handle" in action or action.startswith("OPEN"))
-        ]
-        priority_handle = "right_door_handle" if self.env.cabinet_pos[0] < 0 else "left_door_handle"
-        active_door_actions.sort(key=lambda item: 0 if priority_handle in item[1] else 1)
-        for agent_name, action in active_door_actions:
-            single_actions = {name: "WAIT" for name in ["Alice", "Bob", "Chad"]}
-            single_actions[agent_name] = action
-            response = self._format_cabinet_response(single_actions)
-            if response not in candidates:
-                candidates.append(response)
-        return candidates
+        return (
+            f"EXECUTE\n"
+            f"NAME Alice ACTION {actions['Alice']}\n"
+            f"NAME Bob ACTION {actions['Bob']}\n"
+            f"NAME Chad ACTION {actions['Chad']}"
+        )
 
     def build_fallback_response(self, obs: EnvState) -> Optional[str]:
         if self.env.__class__.__name__ == "PackGroceryTask":
@@ -1641,5 +1581,11 @@ Re-format to strictly follow [Action Output Instruction]!
     def post_episode_update(self):
         # clear for next episode
         self.round_history = []
-        self.failed_plans = []
+        self.failed_plans = [] 
         self.response_history = []
+
+
+
+
+
+

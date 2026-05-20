@@ -3,8 +3,6 @@ import numpy as np
 from rocobench.subtask_plan import LLMPathPlan
 from typing import List, Tuple, Dict, Union, Optional, Any
 from rocobench.envs import MujocoSimEnv, EnvState, RobotState
-from rocobench.envs.env_utils import Pose
-from rocobench.rrt_multi_arm import MultiArmRRT
 from scipy.spatial.transform import Rotation, Slerp
 
 class LLMResponseParser:
@@ -32,212 +30,6 @@ class LLMResponseParser:
         self.use_prepick = use_prepick # if True, separate pre-pick and pick actions
         self.use_preplace = use_preplace # if True, separate pre-place and place actions
         self.split_parsed_plans = split_parsed_plans 
-        self._candidate_ik_planner = None
-
-    def get_agent_robot(self, agent_name: str):
-        try:
-            return self.env.get_sim_robots().get(agent_name)
-        except Exception:
-            return None
-
-    def get_candidate_ik_planner(self):
-        if self._candidate_ik_planner is None:
-            self._candidate_ik_planner = MultiArmRRT(
-                physics=self.env.physics,
-                robots=self.env.get_sim_robots(),
-                graspable_object_names=self.env.get_graspable_objects(),
-                allowed_collision_pairs=self.env.get_allowed_collision_pairs(),
-            )
-        return self._candidate_ik_planner
-
-    def body_geom_radius(self, body_name: str) -> float:
-        """Return a geometry-derived radius for an object's body."""
-        physics = self.env.physics
-        try:
-            body_id = physics.model.body(body_name).id
-        except Exception:
-            return 0.0
-
-        radii = []
-        for geom_id in range(physics.model.ngeom):
-            if int(physics.model.geom_bodyid[geom_id]) == int(body_id):
-                radii.append(float(physics.model.geom_rbound[geom_id]))
-        return max(radii) if len(radii) > 0 else 0.0
-
-    def body_geom_z_range(self, body_name: str) -> Optional[Tuple[float, float]]:
-        """Approximate an object's vertical extent from its attached geoms."""
-        physics = self.env.physics
-        try:
-            body_id = physics.model.body(body_name).id
-        except Exception:
-            return None
-
-        z_lows, z_highs = [], []
-        for geom_id in range(physics.model.ngeom):
-            if int(physics.model.geom_bodyid[geom_id]) != int(body_id):
-                continue
-            center_z = float(physics.data.geom(geom_id).xpos[2])
-            radius = float(physics.model.geom_rbound[geom_id])
-            z_lows.append(center_z - radius)
-            z_highs.append(center_z + radius)
-        if len(z_lows) == 0:
-            return None
-        return min(z_lows), max(z_highs)
-
-    def geom_axis_candidates(self, geom_name: str, samples: int = 11) -> List[np.ndarray]:
-        """Sample points along a cylinder-like geom's local axis in world frame."""
-        physics = self.env.physics
-        try:
-            geom = physics.data.geom(geom_name)
-            geom_id = physics.model.geom(geom_name).id
-        except Exception:
-            return []
-
-        center = np.asarray(geom.xpos, dtype=float)
-        rot = np.asarray(geom.xmat, dtype=float).reshape(3, 3)
-        axis = rot[:, 2]
-        axis_norm = np.linalg.norm(axis)
-        if axis_norm < 1e-9:
-            return [center]
-        axis = axis / axis_norm
-
-        size = np.asarray(physics.model.geom_size[geom_id], dtype=float)
-        half_length = float(size[1] if size.shape[0] > 1 and size[1] > 0 else size[0])
-        if half_length <= 0:
-            return [center]
-        return [center + axis * offset for offset in np.linspace(-half_length, half_length, samples)]
-
-    def weld_body_position(self, site_name: str, agent_name: str) -> Optional[np.ndarray]:
-        """Find the MuJoCo body that will be welded for a grasp site/robot pair."""
-        robot = self.get_agent_robot(agent_name)
-        if robot is None:
-            return None
-        weld_name = f"{site_name}_{robot.weld_body_name}"
-        physics = self.env.physics
-        try:
-            body_id = int(physics.named.model.eq_obj1id[weld_name])
-            body_name = physics.model.id2name(body_id, "body")
-            return np.asarray(physics.data.body(body_name).xpos, dtype=float)
-        except Exception:
-            return None
-
-    def choose_ik_reachable_position(
-        self,
-        agent_name: str,
-        candidates: List[np.ndarray],
-        quat: np.ndarray,
-        reference: np.ndarray,
-        collision_body_name: Optional[str] = None,
-    ) -> np.ndarray:
-        """Pick the closest candidate to reference that the current robot can IK to."""
-        unique = []
-        for pos in candidates:
-            pos = np.asarray(pos, dtype=float)
-            if not any(np.linalg.norm(pos - old) < 1e-6 for old in unique):
-                unique.append(pos)
-        if len(unique) == 0:
-            return np.asarray(reference, dtype=float)
-
-        ordered = sorted(unique, key=lambda pos: np.linalg.norm(pos - reference))
-        allowed_collision_ids = None
-        if collision_body_name is not None:
-            try:
-                allowed_collision_ids = {
-                    name: [] for name in self.env.get_sim_robots().keys()
-                }
-                allowed_collision_ids = {
-                    **allowed_collision_ids,
-                    agent_name: [self.env.physics.model.body(collision_body_name).id],
-                }
-            except Exception:
-                allowed_collision_ids = None
-
-        for pos in ordered:
-            try:
-                ik_result = self.get_candidate_ik_planner().inverse_kinematics_all(
-                    physics=self.env.physics,
-                    ee_poses={
-                        agent_name: Pose(
-                            position=np.asarray(pos, dtype=float),
-                            orientation=np.asarray(quat, dtype=float),
-                        )
-                    },
-                    allow_grasp=True,
-                    check_grasp_ids=allowed_collision_ids,
-                )
-            except Exception:
-                ik_result = {agent_name: None}
-            if ik_result.get(agent_name) is not None:
-                return pos
-        return ordered[0]
-
-    def cabinet_handle_grasp_position(
-        self,
-        agent_name: str,
-        handle_name: str,
-        site_pos: np.ndarray,
-        quat: np.ndarray,
-    ) -> np.ndarray:
-        geom_name = {
-            "left_door_handle": "lefthandle",
-            "right_door_handle": "righthandle",
-        }.get(handle_name)
-        candidates = self.geom_axis_candidates(geom_name) if geom_name is not None else []
-        if len(candidates) == 0:
-            candidates = [site_pos]
-        return self.choose_ik_reachable_position(
-            agent_name,
-            candidates,
-            quat,
-            site_pos,
-            collision_body_name=handle_name,
-        )
-
-    def cabinet_object_grasp_position(
-        self,
-        agent_name: str,
-        obj_name: str,
-        site_name: str,
-        site_pos: np.ndarray,
-        robot_state: RobotState,
-        quat: np.ndarray,
-    ) -> np.ndarray:
-        weld_pos = self.weld_body_position(site_name, agent_name)
-        reference = weld_pos if weld_pos is not None else np.asarray(site_pos, dtype=float)
-        candidates = [reference, np.asarray(site_pos, dtype=float)]
-
-        approach = np.asarray(robot_state.ee_xpos, dtype=float) - reference
-        distance = float(np.linalg.norm(approach))
-        if distance > 1e-9:
-            radius = self.body_geom_radius(obj_name)
-            step = radius if radius > 1e-9 else distance
-            samples = max(2, int(np.ceil(distance / step)))
-            for alpha in np.linspace(0.0, 1.0, samples + 1)[1:]:
-                candidates.append(reference + approach * alpha)
-
-            horizontal = approach.copy()
-            horizontal[2] = 0.0
-            horizontal_distance = float(np.linalg.norm(horizontal))
-            z_range = self.body_geom_z_range(obj_name)
-            if horizontal_distance > 1e-9 and z_range is not None:
-                horizontal_step = radius * 2.0 if radius > 1e-9 else horizontal_distance
-                horizontal_samples = max(2, int(np.ceil(horizontal_distance / horizontal_step)))
-                z_values = np.array([reference[2], np.mean(z_range), z_range[0]], dtype=float)
-                direction = horizontal / horizontal_distance
-                for alpha in np.linspace(0.0, 1.0, horizontal_samples + 1)[1:]:
-                    base = reference + direction * horizontal_distance * alpha
-                    for z in z_values:
-                        pos = base.copy()
-                        pos[2] = z
-                        candidates.append(pos)
-
-        return self.choose_ik_reachable_position(
-            agent_name,
-            candidates,
-            quat,
-            reference,
-            collision_body_name=obj_name,
-        )
 
     def parse(self, obs: EnvState, response: str) -> Tuple[bool, str, List[LLMPathPlan]]: 
         parsed = ''  
@@ -533,35 +325,6 @@ class LLMResponseParser:
 
             pick_pos = obj_state.sites[site_name].xpos
             pick_quat = obj_state.sites[site_name].xquat 
-            if self.env.__class__.__name__ == "CabinetTask" and obj_name in [
-                "left_door_handle",
-                "right_door_handle",
-                "mug",
-                "cup",
-            ]:
-                # Cabinet site quaternions are brittle for IK; use the current
-                # end-effector orientation and choose the grasp position from
-                # scene geometry below.
-                pick_quat = robot_state.ee_xquat.copy()
-            if self.env.__class__.__name__ == "CabinetTask" and obj_name in [
-                "left_door_handle",
-                "right_door_handle",
-            ]:
-                pick_pos = self.cabinet_handle_grasp_position(
-                    agent_name=agent_name,
-                    handle_name=obj_name,
-                    site_pos=np.asarray(pick_pos, dtype=float),
-                    quat=pick_quat,
-                )
-            if self.env.__class__.__name__ == "CabinetTask" and obj_name in ["mug", "cup"]:
-                pick_pos = self.cabinet_object_grasp_position(
-                    agent_name=agent_name,
-                    obj_name=obj_name,
-                    site_name=site_name,
-                    site_pos=np.asarray(pick_pos, dtype=float),
-                    robot_state=robot_state,
-                    quat=pick_quat,
-                )
             if self.env.__class__.__name__ == "SortOneBlockTask":
                 pick_pos = pick_pos.copy()
                 # Sort handoff objects can settle with a very low top site
@@ -681,7 +444,6 @@ class LLMResponseParser:
             place_waypoints = self.add_cabinet_transfer_waypoints(
                 ee_start=pick_target_pose,
                 ee_target=place_target_pose,
-                obj_name=obj_name,
             )
             return_home = False
         else:
@@ -981,8 +743,8 @@ class LLMResponseParser:
             waypoints.append(ee_target)
         return waypoints
 
-    def add_cabinet_transfer_waypoints(self, ee_target, ee_start, obj_name: str) -> List[np.ndarray]:
-        """Lift objects before lateral transfer using object-size clearance."""
+    def add_cabinet_transfer_waypoints(self, ee_target, ee_start) -> List[np.ndarray]:
+        """Lift objects out of the cabinet before moving laterally to a coaster."""
         num_waypoints = self.direct_waypoints + 1
         if num_waypoints <= 0:
             return []
@@ -991,17 +753,20 @@ class LLMResponseParser:
         target_pos = np.asarray(ee_target[:3], dtype=float)
         target_quat = np.asarray(ee_target[3:], dtype=float)
 
-        object_radius = self.body_geom_radius(obj_name)
-        if object_radius <= 1e-9:
-            object_radius = np.linalg.norm(target_pos - start_pos) / max(num_waypoints, 1)
-        safe_z = max(float(start_pos[2]), float(target_pos[2])) + object_radius
+        safe_z = max(float(start_pos[2]), float(target_pos[2])) + 0.20
+        try:
+            cabinet_z = float(self.env.physics.data.body("cabinet").xpos[2])
+            safe_z = max(safe_z, cabinet_z + 0.16)
+        except Exception:
+            pass
+        safe_z = min(max(safe_z, 0.55), 0.85)
 
         lift_pos = start_pos.copy()
         lift_pos[2] = safe_z
         above_target = target_pos.copy()
         above_target[2] = safe_z
         pre_place = target_pos.copy()
-        pre_place[2] = target_pos[2] + object_radius
+        pre_place[2] = max(target_pos[2] + 0.10, min(safe_z, 0.58))
 
         anchors = [start_pos, lift_pos, above_target, pre_place, target_pos]
         return self.sample_pose_polyline(anchors, target_quat, num_waypoints)
